@@ -117,12 +117,12 @@ def render_connector_stub(connector: ConnectorSpec) -> tuple[str, list[str]]:
 
 
 def render_ctx_stub(connectors: list[ConnectorSpec]) -> str:
-    parts = [HEADER, "\n"]
+    parts = [HEADER, "\nfrom ._workflow import Inputs\n"]
     for c in connectors:
         parts.append(f"from .connectors.{c.attr} import {c.class_name}\n")
     parts.append("\nclass Ctx:\n")
     parts.append(indent_docstring(CTX_DOC, "    ") + "\n\n")
-    parts.append("    inputs: dict[str, object]\n")
+    parts.append("    inputs: Inputs\n")
     for c in connectors:
         parts.append(f"    {c.attr}: {c.class_name}\n")
     return "".join(parts)
@@ -135,8 +135,122 @@ only -- getattr(ctx, name) is rejected at create time.
 """
 
 
+WORKFLOW_TYPES_STUB = "_workflow.pyi"
+
+_WORKFLOW_TYPES_DOC = (
+    "# Per-workflow types (D7). The definitions here are the permissive fallback\n"
+    "# your editor sees; `create_workflow` regenerates this module with `Inputs`\n"
+    "# and `Output` narrowed to the schemas the workflow declared, and typechecks\n"
+    "# against that.\n"
+)
+
+
+def render_workflow_types_fallback() -> str:
+    """The ``_workflow.pyi`` that ships in ``runlace_types/`` after discovery."""
+    return (
+        HEADER
+        + _WORKFLOW_TYPES_DOC
+        + "\nfrom typing import TypeAlias\n"
+        + "\nInputs: TypeAlias = dict[str, object]\n"
+        + "Output: TypeAlias = dict[str, object]\n"
+    )
+
+
+def render_workflow_types(
+    inputs_schema: dict[str, Any] | None,
+    outputs_schema: dict[str, Any] | None,
+) -> str:
+    """The ``_workflow.pyi`` used while compiling one workflow.
+
+    ``Inputs`` and ``Output`` are written with the functional ``TypedDict``
+    syntax because both are subscripted or built with the raw JSON key --
+    ``ctx.inputs["from"]``, ``return {"count": n}``. Unlike a tool's keyword
+    arguments, the keys are never renamed, so reserved words are not a problem.
+    """
+    renderer = TypeRenderer()
+    declarations: list[str] = []
+    aliases = False
+
+    inputs = _typed_dict_declaration(renderer, "Inputs", inputs_schema, "Input")
+    if inputs is None:
+        inputs, aliases = "Inputs: TypeAlias = dict[str, object]", True
+    declarations.append(inputs)
+
+    if outputs_schema is None:
+        declarations.append("Output: TypeAlias = dict[str, object]")
+        aliases = True
+    else:
+        output = _typed_dict_declaration(renderer, "Output", outputs_schema, "Output")
+        if output is None:
+            # Not an object schema -- a list, a scalar, a union. A plain alias
+            # says the same thing.
+            expr = renderer.render(outputs_schema, "OutputValue", _defs(outputs_schema))
+            output, aliases = f"Output: TypeAlias = {expr}", True
+        declarations.append(output)
+
+    imports = set(renderer.typing_imports)
+    if aliases:
+        imports.add("TypeAlias")
+
+    parts = [HEADER, _WORKFLOW_TYPES_DOC]
+    if imports:
+        parts.append(f"\nfrom typing import {', '.join(sorted(imports))}\n")
+    for block in renderer.blocks:
+        parts.append("\n" + block + "\n")
+    for declaration in declarations:
+        parts.append("\n" + declaration + "\n")
+    return "".join(parts)
+
+
+def _defs(schema: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for key in ("$defs", "definitions"):
+        local = schema.get(key)
+        if isinstance(local, dict):
+            merged.update(local)
+    return merged
+
+
+def _typed_dict_declaration(
+    renderer: TypeRenderer, name: str, schema: Any, hint: str
+) -> str | None:
+    """Render ``Name = TypedDict(...)``, or ``None`` if the schema is not an object."""
+    if not isinstance(schema, dict):
+        return None
+    if schema.get("type") not in (None, "object"):
+        return None
+    properties = schema.get("properties")
+    if properties is not None and not isinstance(properties, dict):
+        return None
+    if properties is None and schema.get("type") != "object":
+        return None
+
+    required = schema.get("required")
+    required_keys = set(required) if isinstance(required, list) else set()
+    defs = _defs(schema)
+
+    renderer.typing_imports.add("TypedDict")
+    entries: list[str] = []
+    for key, subschema in (properties or {}).items():
+        expr = renderer.render(subschema, f"{hint}{class_name(str(key))}", defs)
+        if str(key) not in required_keys:
+            renderer.typing_imports.add("NotRequired")
+            expr = f"NotRequired[{expr}]"
+        entries.append(f"    {str(key)!r}: {expr},")
+
+    if not entries:
+        return f'{name} = TypedDict("{name}", {{}})'
+    body = "\n".join(entries)
+    return f'{name} = TypedDict("{name}", {{\n{body}\n}})'
+
+
 def render_init_stub() -> str:
-    return HEADER + "\nfrom .ctx import Ctx as Ctx\n\n__all__ = [\"Ctx\"]\n"
+    return (
+        HEADER
+        + "\nfrom ._workflow import Inputs as Inputs, Output as Output\n"
+        + "from .ctx import Ctx as Ctx\n"
+        + '\n__all__ = ["Ctx", "Inputs", "Output"]\n'
+    )
 
 
 def generate(paths: RunlacePaths, connectors: list[ConnectorSpec]) -> GeneratedStubs:
@@ -154,6 +268,7 @@ def generate(paths: RunlacePaths, connectors: list[ConnectorSpec]) -> GeneratedS
         written.append(path)
 
     write(paths.types / "__init__.pyi", render_init_stub())
+    write(paths.types / WORKFLOW_TYPES_STUB, render_workflow_types_fallback())
     write(paths.connectors / "__init__.pyi", HEADER)
 
     for connector in connectors:

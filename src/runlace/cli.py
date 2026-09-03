@@ -1,7 +1,7 @@
 """The ``runlace`` command line.
 
-M1 ships ``init``. ``serve`` and ``sync`` arrive with later milestones and are
-not stubbed out here.
+M1 shipped ``init``; M2 adds ``serve``. ``sync`` arrives with a later milestone
+and is not stubbed out here.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import typer
 from .config import default_config_sources
 from .init_cmd import format_table, run_init
 from .paths import paths as runlace_paths
+from .server import serve as serve_server
 from .typecheck import check_stubs
 
 app = typer.Typer(
@@ -75,6 +76,29 @@ def init(
         typer.echo(result.report())
         if not result.ok:
             raise typer.Exit(code=1)
+
+
+@app.command()
+def serve(
+    http: Annotated[
+        int | None,
+        typer.Option(
+            "--http",
+            help="Serve over streamable HTTP on this port instead of stdio.",
+            show_default=False,
+        ),
+    ] = None,
+) -> None:
+    """Start the Runlace MCP server so any MCP host can add it."""
+    paths = runlace_paths()
+    if not paths.db.exists():
+        typer.secho(
+            f"No Runlace home at {paths.home}. Run `runlace init` first.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+    # stdio is the transport: anything printed to stdout would corrupt it.
+    serve_server(paths, port=http)
 
 
 def _prompt_for_sources(*, assume_yes: bool) -> list[Path]:

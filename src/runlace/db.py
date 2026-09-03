@@ -189,6 +189,140 @@ def insert_tool(
     )
 
 
+def find_workflow(conn: sqlite3.Connection, key: str) -> sqlite3.Row | None:
+    """Look a workflow up by id or by name -- agents reliably have one or the other."""
+    return conn.execute(
+        "SELECT * FROM workflows WHERE id = ? OR name = ?", (key, key)
+    ).fetchone()
+
+
+def insert_workflow(
+    conn: sqlite3.Connection, *, workflow_id: str, name: str, description: str | None
+) -> None:
+    conn.execute(
+        "INSERT INTO workflows(id, name, description) VALUES(?, ?, ?)",
+        (workflow_id, name, description),
+    )
+
+
+def update_workflow_description(
+    conn: sqlite3.Connection, workflow_id: str, description: str | None
+) -> None:
+    conn.execute(
+        "UPDATE workflows SET description = ? WHERE id = ?", (description, workflow_id)
+    )
+
+
+def find_version_by_hash(
+    conn: sqlite3.Connection, workflow_id: str, version_hash: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM workflow_versions WHERE workflow_id = ? AND version_hash = ?",
+        (workflow_id, version_hash),
+    ).fetchone()
+
+
+def find_version(
+    conn: sqlite3.Connection, workflow_id: str, key: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT * FROM workflow_versions
+        WHERE workflow_id = ? AND (id = ? OR version_hash = ?)
+        """,
+        (workflow_id, key, key),
+    ).fetchone()
+
+
+def list_versions(conn: sqlite3.Connection, workflow_id: str) -> list[sqlite3.Row]:
+    """Versions oldest first.
+
+    Ordered by rowid rather than ``created_at``: timestamps have second
+    resolution, and two versions of the same workflow easily land in the same
+    second.
+    """
+    return list(
+        conn.execute(
+            "SELECT * FROM workflow_versions WHERE workflow_id = ? ORDER BY rowid",
+            (workflow_id,),
+        )
+    )
+
+
+def insert_workflow_version(
+    conn: sqlite3.Connection,
+    *,
+    version_id: str,
+    workflow_id: str,
+    version_hash: str,
+    file_path: str,
+    inputs_schema: dict[str, Any] | None,
+    outputs_schema: dict[str, Any] | None,
+    tools_used: list[dict[str, Any]],
+) -> None:
+    """Add a version. Versions are immutable: nothing ever updates this row."""
+    conn.execute(
+        """
+        INSERT INTO workflow_versions(id, workflow_id, version_hash, file_path,
+                                      inputs_schema_json, outputs_schema_json,
+                                      tools_used_json, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            version_id,
+            workflow_id,
+            version_hash,
+            file_path,
+            canonical_json(inputs_schema) if inputs_schema is not None else None,
+            canonical_json(outputs_schema) if outputs_schema is not None else None,
+            canonical_json(tools_used),
+            now_iso(),
+        ),
+    )
+    conn.execute(
+        "UPDATE workflows SET latest_version = ? WHERE id = ?",
+        (version_id, workflow_id),
+    )
+
+
+def list_workflow_summaries(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """One row per workflow, with what `list_workflows` reports."""
+    return list(
+        conn.execute(
+            """
+            SELECT w.id            AS id,
+                   w.name          AS name,
+                   w.description   AS description,
+                   v.version_hash  AS latest_version,
+                   v.created_at    AS latest_created_at,
+                   (SELECT MIN(created_at) FROM workflow_versions
+                     WHERE workflow_id = w.id)          AS created_at,
+                   (SELECT COUNT(*) FROM workflow_versions
+                     WHERE workflow_id = w.id)          AS version_count,
+                   (SELECT r.status FROM runs r
+                      JOIN workflow_versions rv ON rv.id = r.workflow_version_id
+                     WHERE rv.workflow_id = w.id
+                     ORDER BY r.started_at DESC, r.rowid DESC LIMIT 1) AS last_run_status,
+                   (SELECT r.started_at FROM runs r
+                      JOIN workflow_versions rv ON rv.id = r.workflow_version_id
+                     WHERE rv.workflow_id = w.id
+                     ORDER BY r.started_at DESC, r.rowid DESC LIMIT 1) AS last_run_at
+            FROM workflows w
+            LEFT JOIN workflow_versions v ON v.id = w.latest_version
+            ORDER BY w.name
+            """
+        )
+    )
+
+
+def tool_schema_hashes(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
+    """Current ``(connector, tool) -> schema_hash``, for drift comparison."""
+    return {
+        (str(row["connector"]), str(row["name"])): str(row["schema_hash"])
+        for row in conn.execute("SELECT connector, name, schema_hash FROM tools")
+    }
+
+
 def prune_connectors(conn: sqlite3.Connection, keep: list[str]) -> None:
     """Drop connectors that are no longer in the config."""
     if keep:

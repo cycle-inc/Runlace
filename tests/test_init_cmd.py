@@ -91,7 +91,7 @@ def test_unreachable_servers_are_recorded_but_get_no_stub(paths: RunlacePaths) -
     assert all(s != "connected" for s in statuses.values())
     # A stub would let a workflow typecheck against tools we never saw.
     assert list(paths.connectors.glob("*.pyi")) == [paths.connectors / "__init__.pyi"]
-    assert "inputs: dict[str, object]" in (paths.types / "ctx.pyi").read_text()
+    assert "inputs: Inputs" in (paths.types / "ctx.pyi").read_text()
 
 
 def test_rerunning_init_with_fewer_servers_prunes_the_old_ones(paths: RunlacePaths) -> None:

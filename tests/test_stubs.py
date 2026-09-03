@@ -156,7 +156,7 @@ def test_ctx_exposes_one_attribute_per_connector(paths: RunlacePaths) -> None:
     assert "from .connectors.my_server import MyServer" in ctx
     assert "    everything: Everything" in ctx
     assert "    my_server: MyServer" in ctx
-    assert "    inputs: dict[str, object]" in ctx
+    assert "    inputs: Inputs" in ctx
 
 
 def test_generate_removes_stubs_for_connectors_that_went_away(paths: RunlacePaths) -> None:
