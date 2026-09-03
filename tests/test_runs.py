@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from runlace.db import Connection, find_run, list_steps
+from runlace.journal import MAX_ITEMS, get_step
 from runlace.paths import RunlacePaths
 from runlace.runner import ToolFailed
 from runlace.runs import (
@@ -274,6 +275,33 @@ def test_the_reported_steps_leave_the_data_in_the_journal(
         set(s) == {"seq", "connector", "tool", "risk", "status", "duration_ms", "error"}
         for s in result["steps"]
     )
+
+
+def test_get_step_reads_back_what_the_run_did_not_report(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The other half of the rule above: withheld, not lost.
+
+    The workflow returns a count; the fifty rows it counted stay in the journal,
+    and an agent that needs to see their shape asks for them one step at a time.
+    """
+    _, conn = home
+    store(home)
+    rows = [{"id": str(i), "amount": float(i)} for i in range(50)]
+    result = execute(
+        home,
+        confirm=True,
+        call_tool=Recorder({"list_transactions": {"transactions": rows}}),
+    )
+
+    assert result["output"]["count"] == 50
+    assert "amount" not in json.dumps(result["steps"])
+
+    step = get_step(conn, result["run_id"], 2)
+    assert (step["connector"], step["tool"]) == ("pennylane", "list_transactions")
+    assert step["result"]["transactions"][0] == {"id": "0", "amount": 0.0}
+    assert len(step["result"]["transactions"]) == MAX_ITEMS
+    assert f"result.transactions: kept {MAX_ITEMS} of 50 items" in step["trimmed"]
 
 
 # -- gate 1: inputs --------------------------------------------------------

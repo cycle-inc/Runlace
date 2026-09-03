@@ -75,7 +75,8 @@ class Step:
 
         Deliberately without ``payload`` and ``result``: a step that read a
         thousand rows would drown the agent's context. Both are in the journal,
-        which is where a debug trace belongs.
+        which is where a debug trace belongs, and ``get_step`` reads one back
+        when an agent genuinely needs to see the shape of what came out.
         """
         return {
             "seq": self.seq,

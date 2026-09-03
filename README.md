@@ -8,7 +8,8 @@ working name `harness` throughout; everything in this repo has since been
 renamed to Runlace, including the on-disk names D2 and D10 spell out.
 
 **This repo implements M1 through M5 — every milestone in the spec — plus M6,
-the authoring loop: `dry_run_workflow` and `edit_workflow`.**
+the authoring loop: `dry_run_workflow` and `edit_workflow`. Ten MCP tools in
+all.**
 
 ```
 uv tool install runlace          # or: uvx runlace init
@@ -424,10 +425,9 @@ to go through Runlace, with the confirm gate and the journal.
 
 ### `add_connector`, from the chat
 
-The CLI covers the developer. The eighth tool covers their user: "connect my
-Notion" in the chat, no terminal. Same core as `runlace add` — same merge, same
-refusal to write a secret down — behind the same shape of gate as
-`run_workflow`:
+The CLI covers the developer. An MCP tool covers their user: "connect my Notion"
+in the chat, no terminal. Same core as `runlace add` — same merge, same refusal
+to write a secret down — behind the same shape of gate as `run_workflow`:
 
 ```
 add_connector(name="notion", url="https://mcp.notion.com/mcp")
@@ -447,6 +447,70 @@ Two deliberate narrowings compared to the CLI:
 
 `runlace serve` reads the environment once, at startup, so a newly exported
 variable needs a restart. The tool says so when it hands back `needs_env`.
+
+## What crosses into the model's context
+
+Both of the following were found the same way: by connecting a real MCP server
+and reading what actually went over the wire. A test server with four tools
+hides these completely.
+
+### `get_skill` is an index; `get_tools` has the signatures
+
+`get_skill` used to return every connector's whole `.pyi`. One GitHub connector
+is 47 tools and 8,000 tokens of types, read in full to call three of them.
+`SPEC.md` line 71 asked for "the *relevant* `.pyi` excerpts" — returning all of
+them was the drift.
+
+So the index and the signatures are two calls. `get_skill` grows one line per
+tool: name, one line of description, risk. `get_tools(connector, tools)` renders
+the slice of the stub covering the tools that were picked — exact signature,
+which arguments are required, what comes back. It is the same text pyright will
+check the workflow against, so a call written from it compiles.
+
+The generated `<Tool>Input` TypedDicts went at the same time. Arguments are
+keyword-only and the signature spells every one of them out, so the aggregate
+was unreachable — workflow code cannot even import it. Types *nested* inside a
+parameter stay: the signature names those. Measured on three connectors and 74
+tools:
+
+| Call | Before | After |
+|---|---|---|
+| `get_skill` | 20,130 tokens | **8,810** |
+| `get_tools("github", 3 tools)` | — | **554** |
+| `get_tools("github", all 47)` | 9,548 | 6,675 |
+
+The `.pyi` files on disk are untouched by any of this. pyright reads those, and
+it does not have a context window.
+
+### `get_step`, and the rule that makes it rare
+
+`run_workflow` has always reported its steps without their payloads. The journal
+showed the leak had moved: workflows were returning the raw tool results as
+their `output`. One four-call workflow came back with 21,387 characters — the
+four payloads verbatim, under four keys — where a dozen fields were wanted. The
+sandbox had been paid for and not used.
+
+That is a `SKILL.md` problem, not a runtime one: nothing in the document said
+that reducing is the job. It says so now, with the anti-pattern spelled out and
+the note that it compiles — because it does, and nothing in the pipeline will
+catch it.
+
+`get_step(run_id, seq)` is the escape hatch that makes the rule liveable. It
+returns one journaled call, arguments and result, trimmed: long lists cut to
+their first two items, long strings to 300 characters, and a `trimmed` list
+saying what was dropped and from where. Nothing is replaced by an ellipsis
+inside the data — a `"... 47 more"` string sitting in a list of objects would
+misreport the very shape the agent is reading it for.
+
+Two items rather than three, because the first shows the shape and the second
+shows which of its fields were optional after all. On the largest step in a real
+journal that difference was 2,781 tokens against 1,981, for the same
+information.
+
+There is deliberately no flag to ask for the whole payload. The tool exists so
+an agent can see what a tool *looks like* and write correct code against it;
+reading a thousand rows is the workflow's job, in the subprocess. `result_chars`
+reports how much it would have been.
 
 ## A chat UI to drive it with
 

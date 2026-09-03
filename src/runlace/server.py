@@ -16,6 +16,7 @@ from mcp.server.mcpserver import MCPServer
 
 from .connect_cmd import add_connector as _add_connector
 from .db import Connection, connect
+from .journal import get_step as _get_step
 from .paths import RunlacePaths, paths as default_paths
 from .runs import run_workflow as _run_workflow
 from .skill import build_skill, tool_types
@@ -260,9 +261,13 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
         side_effects: [...]}. Show the human exactly which tools those are, and
         call again with confirm=True only after they agree in the conversation.
 
-        Returns {ok, run_id, status, output, steps}. Every attempt is journaled,
-        refusals included, so `run_id` is always worth keeping. On failure the
-        result carries `code`, `error` and `hint`.
+        Returns {ok, run_id, status, output, steps}. `steps` says which tools
+        were called and how they went, without their arguments or their
+        results -- a step that read a thousand rows would fill your context
+        with the data the workflow was supposed to reduce. Use get_step when
+        you need to see one. Every attempt is journaled, refusals included, so
+        `run_id` is always worth keeping. On failure the result carries `code`,
+        `error` and `hint`.
         """
         with session() as conn:
             return await _run_workflow(
@@ -307,6 +312,28 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
                 dry_run=True,
                 version=version,
             )
+
+    @server.tool()
+    def get_step(run_id: str, seq: int) -> dict[str, Any]:
+        """See what one tool call in a run actually sent and received.
+
+        Use this when a workflow crashed on a field that was not there, or when
+        a tool declares no outputSchema and you are writing code against a
+        shape you had to guess. `run_id` comes back from run_workflow and
+        dry_run_workflow; `seq` is the step number in their `steps` list.
+
+        The result is trimmed: long lists are cut to their first few items and
+        long strings to their first few hundred characters, and `trimmed` says
+        what was dropped and from where. That is enough to see the shape and
+        write correct code against it, which is what this is for. There is no
+        way to ask for the whole payload -- reading a thousand rows is the
+        workflow's job, in the sandbox, and `result_chars` tells you how much
+        it would have been.
+
+        On failure `code` is unknown-run or unknown-step.
+        """
+        with session() as conn:
+            return _get_step(conn, run_id, seq)
 
     return server
 

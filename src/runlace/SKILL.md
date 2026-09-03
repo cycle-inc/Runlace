@@ -33,7 +33,8 @@ that code once and get it to compile.
    instead of being called, so nothing leaves the machine and there is no
    confirmation to ask for. The result lists what was stood in for under
    `simulated` — a branch that depends on one of those is the one thing a dry
-   run cannot check for you.
+   run cannot check for you. If a call came back in a shape you did not expect,
+   `get_step(run_id, seq)` shows you that one result.
 5. **`edit_workflow`** — fix what the dry run found. Send `name`, `old_string`
    and `new_string`: one exact string, matching once, copied out of the code
    `get_workflow` gave you. Sending the whole file back to change one line is
@@ -111,8 +112,13 @@ pyright checks your field names. If it does not — and many servers declare
 none — the stub returns `Any`, and nothing is checked. You are guessing at the
 shape, and a wrong guess compiles cleanly and fails at run time.
 
-Two things help:
+Three things help:
 
+- **Dry-run and look.** Write the workflow against your best guess, dry-run it,
+  then call `get_step(run_id, seq)` on the call you were unsure about. You get
+  the real result trimmed to its shape — the field names, the nesting, whether
+  that key holds a list or a dict. Then fix the code with `edit_workflow`. This
+  works for any connected server and needs nothing on your side.
 - **Probe first.** If the same MCP server is connected to your own client, and
   the tool is marked `read_only` in the connector index, call it yourself once
   with realistic arguments and look at what comes back. Then write the workflow
@@ -156,6 +162,44 @@ Bad — the workflow has to be recreated in February:
 ```python
 result = ctx.pennylane.list_transactions(from_="2024-01-01", to="2024-01-31")
 ```
+
+## The output rule
+
+A workflow runs in a subprocess so that the data it touches does not have to
+travel through your context. Returning a tool's payload unchanged hands that
+back: the thousand rows go out to the sandbox and come straight back to you
+anyway, and you have paid for the isolation without getting any of it.
+
+So `run` returns the answer, not the material the answer was computed from.
+Counts, totals, the handful of rows that matter, the flag the human asked
+about. A rough test: if what you return is about the size of what a tool gave
+you, the workflow has not done its job yet.
+
+Bad — every field of every transaction, straight through:
+
+```python
+from runlace_types import Ctx
+
+
+def run(ctx: Ctx) -> dict[str, object]:
+    return {
+        "transactions": ctx.pennylane.list_transactions(
+            from_=ctx.inputs["from"], to=ctx.inputs["to"]
+        )
+    }
+```
+
+That compiles. Nothing in the pipeline will stop it, which is why the rule is
+here. Example 1 below is the same call written the other way, returning three
+numbers. The same goes for chaining: a workflow that makes four calls joins them
+into one answer, rather than returning four payloads side by side under four
+keys. Declaring an `outputs_schema` is the easiest way to hold yourself to it —
+you have to write down what comes back, field by field, and pyright then checks
+that the workflow returns that and nothing more.
+
+When you genuinely need to see a payload — a dry run crashed on a field you
+guessed wrong — read it out of the journal with `get_step(run_id, seq)` rather
+than returning it. What comes back is trimmed to its shape instead of its size.
 
 ## Forbidden patterns
 
@@ -342,7 +386,9 @@ Every refusal carries a `code`. The ones worth recognising:
   return value does not match `outputs_schema`. Fix one or the other and create
   a new version.
 - `workflow-failed` — the code raised. The line number in `detail` is a line of
-  your own code.
+  your own code. If it raised on a tool result — a missing key, a list where you
+  expected a dict — `get_step(run_id, seq)` shows you what that call really
+  returned.
 
 A compile failure is not a refusal code but a list of errors, each with a stage
 (`lint`, `typecheck`, `extract`), a line and a hint. Read the line number: it is

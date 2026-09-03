@@ -53,7 +53,7 @@ def tools_of(server: MCPServer) -> dict[str, Any]:
     return {t.name: t for t in asyncio.run(server.list_tools())}
 
 
-def test_the_server_exposes_the_nine_tools(
+def test_the_server_exposes_the_ten_tools(
     home: tuple[RunlacePaths, Connection]
 ) -> None:
     paths, _ = home
@@ -69,6 +69,7 @@ def test_the_server_exposes_the_nine_tools(
         "get_workflow",
         "run_workflow",
         "dry_run_workflow",
+        "get_step",
     }
     # Descriptions are the interface for a model; none may be empty.
     assert all(t.description for t in tools.values())
@@ -515,6 +516,27 @@ def test_add_connector_never_writes_a_token_the_agent_was_handed(
 
     assert result["code"] == "literal-secret"
     assert "secret_abc" not in paths.config.read_text(encoding="utf-8")
+
+
+def test_get_step_declares_its_arguments(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """Both required: there is no "show me the whole run" spelling on purpose."""
+    paths, _ = home
+    schema = tools_of(build_server(paths))["get_step"].input_schema
+    assert set(schema["required"]) == {"run_id", "seq"}
+    assert set(schema["properties"]) == {"run_id", "seq"}
+
+
+def test_get_step_on_a_run_that_never_happened_says_where_run_ids_come_from(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, _ = home
+    result = call(build_server(paths), "get_step", run_id="run_nope", seq=1)
+
+    assert result["ok"] is False
+    assert result["code"] == "unknown-run"
+    assert "run_workflow" in result["hint"]
 
 
 # -- the transport ---

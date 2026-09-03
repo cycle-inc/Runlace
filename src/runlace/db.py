@@ -462,6 +462,12 @@ def list_steps(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
     )
 
 
+def find_step(conn: sqlite3.Connection, run_id: str, seq: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM steps WHERE run_id = ? AND seq = ?", (run_id, seq)
+    ).fetchone()
+
+
 def tool_schema_hashes(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
     """Current ``(connector, tool) -> schema_hash``, for drift comparison."""
     return {
