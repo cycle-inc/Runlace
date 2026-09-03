@@ -780,6 +780,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyright" },
     { name = "typer" },
+    { name = "typing-extensions" },
 ]
 
 [package.dev-dependencies]
@@ -795,6 +796,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pyright", specifier = ">=1.1.390" },
     { name = "typer", specifier = ">=0.12" },
+    { name = "typing-extensions", specifier = ">=4.12" },
 ]
 
 [package.metadata.requires-dev]

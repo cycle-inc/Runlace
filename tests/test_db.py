@@ -35,6 +35,83 @@ def test_connect_is_idempotent(tmp_path: Path) -> None:
     ] == str(db.SCHEMA_VERSION)
 
 
+def columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def test_a_fresh_database_is_at_the_current_version(conn: sqlite3.Connection) -> None:
+    assert "error" in columns(conn, "runs")
+
+
+def test_an_older_database_is_migrated_in_place(tmp_path: Path) -> None:
+    """A Runlace home is the user's data: it gets upgraded, never recreated."""
+    path = tmp_path / "runlace.db"
+    old = sqlite3.connect(path)
+    old.executescript(db.SCHEMA)
+    old.execute("INSERT INTO meta(key, value) VALUES('schema_version', '1')")
+    old.execute("INSERT INTO workflows(id, name, description) VALUES('wf_1', 'keep', 'd')")
+    old.commit()
+    old.close()
+
+    migrated = db.connect(path)
+    assert "error" in columns(migrated, "runs")
+    assert migrated.execute("SELECT name FROM workflows").fetchone()["name"] == "keep"
+    assert migrated.execute(
+        "SELECT value FROM meta WHERE key='schema_version'"
+    ).fetchone()["value"] == str(db.SCHEMA_VERSION)
+
+
+def test_migrating_an_up_to_date_database_does_nothing(tmp_path: Path) -> None:
+    path = tmp_path / "runlace.db"
+    db.connect(path).close()
+    db.connect(path).close()  # would raise "duplicate column" if replayed
+    assert db.SCHEMA_VERSION == 1 + len(db.MIGRATIONS)
+
+
+# -- runs and steps --------------------------------------------------------
+
+
+def test_a_run_is_open_before_it_is_finished(conn: sqlite3.Connection) -> None:
+    """The row is written first, so a crash mid-run still leaves a trace."""
+    conn.execute("INSERT INTO workflows(id, name, description) VALUES('wf_1', 'w', 'd')")
+    conn.execute(
+        "INSERT INTO workflow_versions(id, workflow_id, version_hash, file_path, "
+        "inputs_schema_json, tools_used_json, created_at) "
+        "VALUES('v_1', 'wf_1', 'h', '/tmp/w.py', '{}', '[]', '2026-01-01T00:00:00Z')"
+    )
+    db.insert_run(conn, run_id="run_1", workflow_version_id="v_1", inputs={"a": 1}, confirmed=True)
+    row = db.find_run(conn, "run_1")
+    assert row is not None
+    assert (row["status"], row["confirmed"], row["finished_at"]) == ("running", 1, None)
+
+    db.insert_step(
+        conn,
+        step_id="st_1",
+        run_id="run_1",
+        seq=1,
+        connector="everything",
+        tool="echo",
+        risk="read_only",
+        payload={"message": "hi"},
+        result={"echo": "hi"},
+        status="ok",
+        duration_ms=3,
+        error=None,
+    )
+    db.finish_run(conn, "run_1", status="completed", output={"ok": True})
+
+    row = db.find_run(conn, "run_1")
+    assert row is not None
+    assert (row["status"], row["error"]) == ("completed", None)
+    assert row["finished_at"] is not None
+    assert [s["tool"] for s in db.list_steps(conn, "run_1")] == ["echo"]
+
+
+def test_a_run_disappears_with_the_version_it_belongs_to(conn: sqlite3.Connection) -> None:
+    assert db.find_run(conn, "run_missing") is None
+    assert db.list_steps(conn, "run_missing") == []
+
+
 def add_connector(conn: sqlite3.Connection, name: str = "everything", tool_count: int = 1) -> None:
     db.replace_connector(
         conn,

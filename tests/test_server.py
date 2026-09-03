@@ -53,7 +53,9 @@ def tools_of(server: MCPServer) -> dict[str, Any]:
     return {t.name: t for t in asyncio.run(server.list_tools())}
 
 
-def test_the_server_exposes_m2s_tools(home: tuple[RunlacePaths, Connection]) -> None:
+def test_the_server_exposes_the_five_tools(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
     paths, _ = home
     server = build_server(paths)
     tools = tools_of(server)
@@ -62,6 +64,7 @@ def test_the_server_exposes_m2s_tools(home: tuple[RunlacePaths, Connection]) -> 
         "create_workflow",
         "list_workflows",
         "get_workflow",
+        "run_workflow",
     }
     # Descriptions are the interface for a model; none may be empty.
     assert all(t.description for t in tools.values())
@@ -169,9 +172,66 @@ def test_getting_an_unknown_workflow_says_what_to_do(
     assert "list_workflows" in result["hint"]
 
 
-def test_run_workflow_is_not_exposed_yet(
+def test_run_workflow_declares_its_arguments(
     home: tuple[RunlacePaths, Connection]
 ) -> None:
-    """M3's tool. Advertising it before it works would be worse than absent."""
     paths, _ = home
-    assert "run_workflow" not in tools_of(build_server(paths))
+    schema = tools_of(build_server(paths))["run_workflow"].input_schema
+    assert schema["required"] == ["workflow_id"]
+    assert set(schema["properties"]) == {"workflow_id", "inputs", "confirm", "version"}
+
+
+def test_run_workflow_refuses_a_side_effect_without_confirm(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The gate that matters most, seen exactly as the agent sees it (D6)."""
+    paths, _ = home
+    server = build_server(paths)
+    call(
+        server,
+        "create_workflow",
+        name="notify",
+        description="d",
+        code=SENDS_EMAIL,
+        inputs_schema=INPUTS,
+    )
+
+    result = call(
+        server, "run_workflow", workflow_id="notify", inputs={"to": "a@b.c"}
+    )
+    assert result["ok"] is False
+    assert result["code"] == "needs-confirmation"
+    assert result["side_effects"] == [{"connector": "gmail", "tool": "send_email"}]
+    # Refused is still journaled: the agent gets a run_id to show the human.
+    assert result["run_id"].startswith("run_")
+
+
+def test_run_workflow_reports_a_server_it_cannot_reach(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The fixture's connectors are not real. Failing to connect is a run failure."""
+    paths, _ = home
+    server = build_server(paths)
+    call(
+        server,
+        "create_workflow",
+        name="report",
+        description="d",
+        code=BALANCE,
+        inputs_schema=INPUTS,
+    )
+
+    result = call(server, "run_workflow", workflow_id="report", inputs={"to": "a@b.c"})
+    assert result["ok"] is False
+    assert result["code"] == "connector-unreachable"
+    assert "runlace init" in result["hint"]
+
+
+def test_running_an_unknown_workflow_says_what_to_do(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, _ = home
+    result = call(build_server(paths), "run_workflow", workflow_id="nope")
+    assert result["ok"] is False
+    assert result["code"] == "unknown-workflow"
+    assert "list_workflows" in result["hint"]

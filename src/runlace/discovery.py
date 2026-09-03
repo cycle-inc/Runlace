@@ -65,8 +65,12 @@ def _to_discovered(tool: Tool) -> DiscoveredTool:
 
 
 @asynccontextmanager
-async def _transport(connector: Connector) -> AsyncIterator[tuple[Any, Any]]:
-    """Open the right client for the connector's transport."""
+async def open_transport(connector: Connector) -> AsyncIterator[tuple[Any, Any]]:
+    """Open the right client for the connector's transport.
+
+    Public because runs need it too: :mod:`runlace.sessions` opens a session per
+    connector while a workflow executes.
+    """
     if connector.transport == "stdio":
         assert connector.command is not None
         params = StdioServerParameters(
@@ -104,7 +108,7 @@ async def _transport(connector: Connector) -> AsyncIterator[tuple[Any, Any]]:
 
 
 async def _list_tools(connector: Connector) -> list[DiscoveredTool]:
-    async with _transport(connector) as (read, write):
+    async with open_transport(connector) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.list_tools()

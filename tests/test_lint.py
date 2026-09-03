@@ -25,6 +25,7 @@ from runlace.lint import (
     E_RELATIVE_IMPORT,
     E_RETURN_ANNOTATION,
     E_RUN_SIGNATURE,
+    E_STUB_SUBMODULE,
     E_SYNTAX,
     lint,
 )
@@ -137,6 +138,18 @@ def test_imports_off_the_allowlist_are_rejected() -> None:
     errors = lint(workflow("pass", preamble="\nimport pandas"))
     assert [e.code for e in errors] == [E_IMPORT_NOT_ALLOWED]
     assert "pandas" in errors[0].message
+
+
+def test_reaching_into_the_stub_package_is_rejected() -> None:
+    """`runlace_types` is `.pyi` files. Only its top level exists at run time."""
+    errors = lint(
+        workflow(
+            "pass",
+            preamble="\nfrom runlace_types.connectors import pennylane",
+        )
+    )
+    assert [e.code for e in errors] == [E_STUB_SUBMODULE]
+    assert "runlace_types.connectors" in errors[0].message
 
 
 # -- the ctx rules that keep extraction sound ------------------------------

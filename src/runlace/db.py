@@ -1,9 +1,8 @@
 """SQLite storage.
 
-The four workflow tables come straight from the spec and are created here at
-bootstrap even though M1 does not write to them. ``connectors`` and ``tools``
-are M1's own: discovery has to persist somewhere, and D10 puts everything but
-workflow code in the database.
+The four workflow tables come straight from the spec. ``connectors`` and
+``tools`` are Runlace's own: discovery has to persist somewhere, and D10 puts
+everything but workflow code in the database.
 """
 
 from __future__ import annotations
@@ -16,8 +15,6 @@ from typing import Any
 from .hashing import canonical_json
 
 Connection = sqlite3.Connection
-
-SCHEMA_VERSION = 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -78,7 +75,7 @@ CREATE TABLE IF NOT EXISTS runs (
     workflow_version_id TEXT NOT NULL REFERENCES workflow_versions(id) ON DELETE CASCADE,
     inputs_json         TEXT,
     confirmed           INTEGER NOT NULL DEFAULT 0,
-    status              TEXT NOT NULL,       -- completed | failed
+    status              TEXT NOT NULL,       -- running | completed | failed
     output_json         TEXT,
     started_at          TEXT NOT NULL,
     finished_at         TEXT
@@ -101,6 +98,18 @@ CREATE TABLE IF NOT EXISTS steps (
 """
 
 
+# SCHEMA above is version 1. Every change since is a statement here, applied in
+# order to whatever version a database is already at. Only additive changes
+# belong in this list: a Runlace home is the user's data.
+MIGRATIONS = [
+    # v2 (M3): why a run failed or was refused. `status` says that it did; this
+    # says what to tell the human.
+    "ALTER TABLE runs ADD COLUMN error TEXT",
+]
+
+SCHEMA_VERSION = 1 + len(MIGRATIONS)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -112,6 +121,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -119,6 +129,18 @@ def connect(db_path: Path) -> sqlite3.Connection:
     )
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to :data:`SCHEMA_VERSION`.
+
+    A database that ``executescript(SCHEMA)`` just created is at version 1, the
+    same as one written by an older Runlace, so both take the same path.
+    """
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    current = int(row["value"]) if row is not None else 1
+    for statement in MIGRATIONS[current - 1 :]:
+        conn.execute(statement)
 
 
 def replace_connector(
@@ -312,6 +334,114 @@ def list_workflow_summaries(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             ORDER BY w.name
             """
         )
+    )
+
+
+def find_tool_by_method(
+    conn: sqlite3.Connection, attr: str, method: str
+) -> sqlite3.Row | None:
+    """Resolve ``ctx.<attr>.<method>`` to the connector and tool it stands for."""
+    return conn.execute(
+        """
+        SELECT c.name AS connector, t.name AS tool, t.risk AS risk,
+               t.input_schema_json AS input_schema_json
+        FROM tools t
+        JOIN connectors c ON c.name = t.connector
+        WHERE c.attr = ? AND t.method = ?
+        """,
+        (attr, method),
+    ).fetchone()
+
+
+# -- runs and steps --------------------------------------------------------
+
+
+def insert_run(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    workflow_version_id: str,
+    inputs: Any,
+    confirmed: bool,
+) -> None:
+    """Open a run. Written before anything is attempted, so a crash leaves a trace."""
+    conn.execute(
+        """
+        INSERT INTO runs(id, workflow_version_id, inputs_json, confirmed, status,
+                         started_at)
+        VALUES(?, ?, ?, ?, 'running', ?)
+        """,
+        (run_id, workflow_version_id, canonical_json(inputs), int(confirmed), now_iso()),
+    )
+
+
+def finish_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    status: str,
+    output: Any = None,
+    error: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE runs SET status = ?, output_json = ?, error = ?, finished_at = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            canonical_json(output) if output is not None else None,
+            error,
+            now_iso(),
+            run_id,
+        ),
+    )
+
+
+def insert_step(
+    conn: sqlite3.Connection,
+    *,
+    step_id: str,
+    run_id: str,
+    seq: int,
+    connector: str,
+    tool: str,
+    risk: str,
+    payload: Any,
+    result: Any,
+    status: str,
+    duration_ms: int,
+    error: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO steps(id, run_id, seq, connector, tool, risk, payload_json,
+                          result_json, status, duration_ms, error)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            step_id,
+            run_id,
+            seq,
+            connector,
+            tool,
+            risk,
+            canonical_json(payload),
+            canonical_json(result) if result is not None else None,
+            status,
+            duration_ms,
+            error,
+        ),
+    )
+
+
+def find_run(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+
+
+def list_steps(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
+    return list(
+        conn.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY seq", (run_id,))
     )
 
 

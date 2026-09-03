@@ -6,6 +6,7 @@ from typing import Any, Iterator
 
 import pytest
 
+from runlace.config import Connector, write_config
 from runlace.db import Connection, connect, insert_tool, replace_connector
 from runlace.hashing import schema_hash
 from runlace.naming import python_identifier
@@ -101,6 +102,7 @@ def home(paths: RunlacePaths) -> Iterator[tuple[RunlacePaths, Connection]]:
     """
     conn = connect(paths.db)
     specs: list[ConnectorSpec] = []
+    configured: list[Connector] = []
     for name, attr, tools in FAKE_CONNECTORS:
         replace_connector(
             conn,
@@ -139,7 +141,11 @@ def home(paths: RunlacePaths) -> Iterator[tuple[RunlacePaths, Connection]]:
                 )
             )
         specs.append(ConnectorSpec(name=name, attr=attr, tools=tool_specs))
+        configured.append(
+            Connector(name=name, attr=attr, transport="stdio", command="true")
+        )
     conn.commit()
+    write_config(paths.config, configured)
     generate(paths, specs)
     try:
         yield paths, conn

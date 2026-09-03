@@ -67,6 +67,7 @@ E_SYNTAX = "syntax-error"
 E_FORBIDDEN_IMPORT = "forbidden-import"
 E_IMPORT_NOT_ALLOWED = "import-not-allowed"
 E_RELATIVE_IMPORT = "relative-import"
+E_STUB_SUBMODULE = "stub-submodule-import"
 E_FORBIDDEN_CALL = "forbidden-call"
 E_DYNAMIC_ACCESS = "dynamic-attribute-access"
 E_DUNDER_ACCESS = "dunder-access"
@@ -257,7 +258,22 @@ class _Checker:
 
     def _check_module(self, node: ast.AST, dotted: str) -> None:
         root = dotted.split(".")[0]
-        if root == STUB_PACKAGE or root in ALLOWED_IMPORTS:
+        if root == STUB_PACKAGE:
+            if dotted != STUB_PACKAGE:
+                # The generated package is stubs only: `.pyi` files with no code
+                # behind them. Its top-level names exist at run time because the
+                # runner provides them; nothing deeper can.
+                self.add(
+                    node,
+                    E_STUB_SUBMODULE,
+                    f"`{dotted}` cannot be imported at run time",
+                    f"Import only from the top level: "
+                    f"`from {STUB_PACKAGE} import Ctx, {OUTPUT_TYPE}`. The "
+                    f"connector modules are type stubs; annotate with the types "
+                    f"the tools already return instead.",
+                )
+            return
+        if root in ALLOWED_IMPORTS:
             return
         if root in FORBIDDEN_IMPORTS:
             self.add(

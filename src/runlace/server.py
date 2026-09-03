@@ -16,6 +16,7 @@ from mcp.server.mcpserver import MCPServer
 
 from .db import Connection, connect
 from .paths import RunlacePaths, paths as default_paths
+from .runs import run_workflow as _run_workflow
 from .skill import build_skill
 from .workflows import create_workflow as _create_workflow
 from .workflows import get_workflow as _get_workflow
@@ -121,6 +122,38 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
                 "hint": "Call list_workflows to see what exists.",
             }
         return record
+
+    @server.tool()
+    async def run_workflow(
+        workflow_id: str,
+        inputs: dict[str, Any] | None = None,
+        confirm: bool = False,
+        version: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute a stored workflow. No model is involved: it just runs.
+
+        `workflow_id` may also be the workflow's name. `inputs` must match the
+        workflow's inputs_schema; call get_workflow if you are unsure what it
+        declares.
+
+        Call this WITHOUT `confirm` first. If the workflow uses any tool that
+        acts on the world, it is refused with {code: "needs-confirmation",
+        side_effects: [...]}. Show the human exactly which tools those are, and
+        call again with confirm=True only after they agree in the conversation.
+
+        Returns {ok, run_id, status, output, steps}. Every attempt is journaled,
+        refusals included, so `run_id` is always worth keeping. On failure the
+        result carries `code`, `error` and `hint`.
+        """
+        with session() as conn:
+            return await _run_workflow(
+                conn,
+                home,
+                workflow=workflow_id,
+                inputs=inputs,
+                confirm=confirm,
+                version=version,
+            )
 
     return server
 
