@@ -18,7 +18,7 @@ from .connect_cmd import add_connector as _add_connector
 from .db import Connection, connect
 from .paths import RunlacePaths, paths as default_paths
 from .runs import run_workflow as _run_workflow
-from .skill import build_skill
+from .skill import build_skill, tool_types
 from .workflows import create_workflow as _create_workflow
 from .workflows import edit_workflow as _edit_workflow
 from .workflows import get_workflow as _get_workflow
@@ -54,12 +54,36 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
         """Learn how to write a Runlace workflow, and what this machine can do.
 
         Call this first. Returns the skill document (calling convention, file
-        contract, forbidden patterns), an index of every connected MCP server
-        with its tools and their risk, and the generated type stubs those
-        workflows are checked against.
+        contract, forbidden patterns) and an index of every connected MCP
+        server: each tool's name, one line of description, and its risk.
+
+        The index is what you need to pick your tools. It deliberately does not
+        carry their signatures -- one connector can be fifty tools, and you are
+        about to use three. Call get_tools for those three.
         """
         with session() as conn:
-            return build_skill(conn, home)
+            return build_skill(conn)
+
+    @server.tool()
+    def get_tools(connector: str, tools: list[str] | None = None) -> dict[str, Any]:
+        """Get the exact signatures of the tools you are about to call.
+
+        The second half of get_skill, on demand. Returns `types`: the generated
+        `.pyi` for those tools -- keyword arguments with their Python types,
+        which are required, the return type, the full description and the risk.
+        It is a slice of what pyright checks your code against, so a call
+        written against it compiles.
+
+        `tools` takes either spelling the index shows, the MCP name
+        (`get-sum`) or the method (`get_sum`). Omit it to get the whole
+        connector, which is worth it for a small one and expensive for a large
+        one.
+
+        Names you asked for that do not exist come back in `unknown` rather
+        than failing the call.
+        """
+        with session() as conn:
+            return tool_types(conn, connector, tools)
 
     # Deliberately sync: discovery calls asyncio.run, which cannot happen inside
     # a running loop. The SDK runs sync tools on a worker thread, so this is the

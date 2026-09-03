@@ -85,8 +85,13 @@ def render_connector_stub(connector: ConnectorSpec) -> tuple[str, list[str]]:
             )
             continue
 
-        if shape.fields:
-            renderer.add_typed_dict(f"{hint}Input", shape.fields)
+        # No `<Tool>Input` TypedDict. Arguments are keyword-only and the
+        # signature spells every one of them out, so an aggregate of the same
+        # fields is unreachable: workflow code cannot even import it (see the
+        # `stub-submodule-import` lint). It was a third of what `get_tools`
+        # sends an agent to read. Types *nested* inside a parameter are a
+        # different matter -- the signature names those, and the renderer emits
+        # them on its own.
 
         if tool.output_schema:
             return_type = renderer.render(tool.output_schema, f"{hint}Output")

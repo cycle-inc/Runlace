@@ -9,18 +9,24 @@ that code once and get it to compile.
 ## The loop
 
 1. **`get_skill`** — you are here. Below this document you were sent a
-   `connectors` index (every tool on this machine, with its risk) and `stubs`
-   (the generated `.pyi` files). Read them: they are the ground truth for what
-   you can call, and they are specific to this machine.
-2. **`create_workflow`** — send `name`, `description`, `code`, `inputs_schema`,
+   `connectors` index: every tool on this machine, one line each, with its risk.
+   It is the ground truth for what you can call, and it is specific to this
+   machine. Read it and decide which tools your workflow needs.
+2. **`get_tools`** — for the few you picked, and only those, ask for their
+   signatures: `get_tools("github", ["search_code", "get_me"])`. You get the
+   generated `.pyi` for them — keyword arguments with their types, which are
+   required, and what comes back. This is the same text pyright will check your
+   code against, so a call written against it compiles. The index gives you
+   names; this gives you calls. Do not guess a signature you have not read.
+3. **`create_workflow`** — send `name`, `description`, `code`, `inputs_schema`,
    and `outputs_schema` if you want the return value checked. `inputs_schema` is
    always an object and is never `null`; a workflow that reads nothing from
    `ctx.inputs` declares `{"type": "object", "properties": {}}`. The code is
-   compiled: linted, typechecked with pyright against those stubs, and its tool
+   compiled: linted, typechecked with pyright against the generated stubs, and its tool
    calls extracted and pinned. On failure you get the stage, the line number, an
    error code and a hint. Fix and send again — that is a normal part of the loop,
    not a failure of the task.
-3. **`dry_run_workflow`** — run it before you claim it works. Compiling proves
+4. **`dry_run_workflow`** — run it before you claim it works. Compiling proves
    the calls have the right shape; only running proves your code survives what
    the tools actually return. Reads hit the live servers and give you the real
    answers; anything that would act is answered from its declared output shape
@@ -28,11 +34,11 @@ that code once and get it to compile.
    confirmation to ask for. The result lists what was stood in for under
    `simulated` — a branch that depends on one of those is the one thing a dry
    run cannot check for you.
-4. **`edit_workflow`** — fix what the dry run found. Send `name`, `old_string`
+5. **`edit_workflow`** — fix what the dry run found. Send `name`, `old_string`
    and `new_string`: one exact string, matching once, copied out of the code
    `get_workflow` gave you. Sending the whole file back to change one line is
    where most mistakes come from. You get a new version; the old one stays.
-5. **`run_workflow`** — execute it for real. If the workflow touches any
+6. **`run_workflow`** — execute it for real. If the workflow touches any
    side-effecting tool, the run is refused until you show the human exactly
    which tools will act and call again with `confirm=True`.
 
@@ -63,9 +69,10 @@ Arguments are keyword-only. A JSON key that is a Python reserved word gets a
 trailing underscore in the stub (`from` becomes `from_`, `class` becomes
 `class_`) and is mapped back to the original name at run time.
 
-Read the `.pyi` excerpt for a connector before calling it. It carries the exact
-parameter names, which ones are required, the return type, and the tool's risk
-in the docstring.
+Call `get_tools` for a tool before you call the tool. What it returns carries
+the exact parameter names, which ones are required, the return type, and the
+tool's risk in the docstring. The index alone does not — it has names, not
+signatures.
 
 ## The workflow file contract
 

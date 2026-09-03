@@ -46,10 +46,44 @@ def test_side_effect_risk_is_visible_in_the_stub() -> None:
     assert "(risk: side_effect)" in source
 
 
-def test_input_typed_dict_is_generated() -> None:
+def test_no_input_typed_dict_duplicates_the_signature() -> None:
+    """Arguments live in the signature. A parallel TypedDict nobody can name is
+    a third of what `get_tools` sends an agent to read."""
     source, _ = render_connector_stub(ConnectorSpec("everything", "everything", [tool()]))
-    assert "class EchoInput(TypedDict):" in source
-    assert "message: str" in source
+    assert "EchoInput" not in source
+    assert "def echo(self, *, message: str)" in source
+
+
+def test_a_type_nested_in_a_parameter_is_still_declared() -> None:
+    """The signature names this one, so dropping it would not typecheck."""
+    source, _ = render_connector_stub(
+        ConnectorSpec(
+            "files",
+            "files",
+            [
+                tool(
+                    name="edit",
+                    method="edit",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "edits": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"old": {"type": "string"}},
+                                    "required": ["old"],
+                                },
+                            }
+                        },
+                        "required": ["edits"],
+                    },
+                )
+            ],
+        )
+    )
+    assert "class EditEditsItem(TypedDict):" in source
+    assert "def edit(self, *, edits: list[EditEditsItem])" in source
 
 
 def test_optional_parameters_get_a_stub_default() -> None:

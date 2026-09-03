@@ -53,7 +53,7 @@ def tools_of(server: MCPServer) -> dict[str, Any]:
     return {t.name: t for t in asyncio.run(server.list_tools())}
 
 
-def test_the_server_exposes_the_eight_tools(
+def test_the_server_exposes_the_nine_tools(
     home: tuple[RunlacePaths, Connection]
 ) -> None:
     paths, _ = home
@@ -61,6 +61,7 @@ def test_the_server_exposes_the_eight_tools(
     tools = tools_of(server)
     assert set(tools) == {
         "get_skill",
+        "get_tools",
         "add_connector",
         "create_workflow",
         "edit_workflow",
@@ -100,9 +101,10 @@ def test_the_no_inputs_spelling_is_written_down_where_an_agent_will_read_it(
     assert empty in call(server, "get_skill")["skill"]
 
 
-def test_get_skill_lists_the_connectors_and_their_stubs(
+def test_get_skill_indexes_the_connectors_without_their_signatures(
     home: tuple[RunlacePaths, Connection]
 ) -> None:
+    """Names and risk, which is what you need to choose. Not 8,000 tokens of types."""
     paths, _ = home
     skill = call(build_server(paths), "get_skill")
 
@@ -115,8 +117,69 @@ def test_get_skill_lists_the_connectors_and_their_stubs(
     assert tools["list_transactions"]["call"] == "ctx.pennylane.list_transactions(...)"
     assert connectors["gmail"]["tools"][0]["risk"] == "side_effect"
 
-    assert "runlace_types/connectors/pennylane.pyi" in skill["stubs"]
-    assert "def list_transactions" in skill["stubs"]["runlace_types/connectors/pennylane.pyi"]
+    assert "stubs" not in skill
+    assert "get_tools" in skill["next"]
+
+
+def test_get_tools_returns_the_signature_of_the_tools_asked_for(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, _ = home
+    result = call(
+        build_server(paths), "get_tools", connector="pennylane", tools=["list_transactions"]
+    )
+
+    assert result["ok"] is True
+    assert "def list_transactions" in result["types"]
+    assert result["tools"] == [
+        {
+            "tool": "list_transactions",
+            "call": "ctx.pennylane.list_transactions(...)",
+            "risk": "read_only",
+        }
+    ]
+    # The other tools of the same connector are not along for the ride.
+    assert "def get_balance" not in result["types"]
+
+
+def test_get_tools_takes_the_connector_by_attribute_too(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """An agent copies whichever spelling the index put nearest its hand."""
+    paths, _ = home
+    server = build_server(paths)
+    by_name = call(server, "get_tools", connector="pennylane")
+    by_attr = call(server, "get_tools", connector="pennylane", tools=None)
+
+    assert by_name["types"] == by_attr["types"]
+    assert "def get_balance" in by_name["types"]
+
+
+def test_get_tools_names_what_it_did_not_find_rather_than_failing(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, _ = home
+    result = call(
+        build_server(paths),
+        "get_tools",
+        connector="pennylane",
+        tools=["list_transactions", "nope"],
+    )
+
+    assert result["ok"] is True
+    assert result["unknown"] == ["nope"]
+    assert "def list_transactions" in result["types"]
+
+
+def test_get_tools_on_an_unknown_connector_says_where_to_look(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, _ = home
+    result = call(build_server(paths), "get_tools", connector="stripe")
+
+    assert result["ok"] is False
+    assert result["code"] == "unknown-connector"
+    assert "get_skill" in result["hint"]
 
 
 def test_create_then_get_round_trips(home: tuple[RunlacePaths, Connection]) -> None:

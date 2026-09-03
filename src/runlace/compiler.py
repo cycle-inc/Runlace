@@ -231,12 +231,14 @@ _TYPECHECK_HINTS = {
         "connectors and their tools, and check the spelling."
     ),
     "reportCallIssue": (
-        "Check the tool's parameters against its stub: arguments are "
-        "keyword-only, and required ones cannot be omitted."
+        "Check the tool's parameters against its signature: arguments are "
+        "keyword-only, and required ones cannot be omitted. Call "
+        "`get_tools(connector, [tool])` to see it."
     ),
     "reportArgumentType": (
         "The value's type does not match the tool's schema. Convert it, or narrow "
-        "the result you took it from."
+        "the result you took it from. `get_tools(connector, [tool])` has the "
+        "types it declares."
     ),
     "reportTypedDictNotRequiredAccess": (
         "That key is optional in the schema. Use `.get(...)` or declare it "
