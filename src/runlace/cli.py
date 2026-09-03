@@ -150,6 +150,13 @@ def serve(
             show_default=False,
         ),
     ] = None,
+    host: Annotated[
+        str,
+        typer.Option(
+            "--host",
+            help="Interface to bind --http to. Use 0.0.0.0 to let a container reach it.",
+        ),
+    ] = "127.0.0.1",
 ) -> None:
     """Start the Runlace MCP server so any MCP host can add it."""
     paths = runlace_paths()
@@ -159,8 +166,17 @@ def serve(
             fg=typer.colors.RED,
         )
         raise typer.Exit(code=1)
+    if http is not None and host != "127.0.0.1":
+        # Loud on purpose. Anything that can reach this port can run a stored
+        # workflow, and `confirm=True` is one JSON field away.
+        typer.secho(
+            f"Serving on {host}:{http} -- reachable from outside this machine. "
+            f"Anything that can reach it can run your workflows.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
     # stdio is the transport: anything printed to stdout would corrupt it.
-    serve_server(paths, port=http)
+    serve_server(paths, port=http, host=host)
 
 
 def _prompt_for_sources(*, assume_yes: bool) -> list[Path]:

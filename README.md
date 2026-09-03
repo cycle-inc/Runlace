@@ -341,6 +341,41 @@ version that was edited stays on disk, readable and runnable.
 dry run that finds it on real data without toggling anything, a one-string fix,
 a second dry run that passes, then refused-without-confirm and completed-with-it.
 
+## A chat UI to drive it with
+
+`docker/chat/` brings up [Open WebUI](https://github.com/open-webui/open-webui)
+on `http://localhost:3000`, pointed at Mistral's OpenAI-compatible API, with
+Runlace registered as an MCP tool server.
+
+```
+runlace serve --http 8000 --host 0.0.0.0   # terminal 1
+./scripts/chat_ui.sh up                    # terminal 2
+```
+
+Then, in the UI: **Settings → Tools → Add**, type `MCP`, URL
+`http://host.docker.internal:8000/mcp`. Set the model's **Function Calling** to
+`Native` in its Advanced Params — the prompt-based fallback cannot chain seven
+tools.
+
+Three things about that layout are deliberate:
+
+- **Runlace stays on the host.** It launches your MCP servers as local
+  subprocesses (`npx`, `uvx`, whatever `runlace init` found) and reads
+  `~/.runlace`. Containerising it would mean rebuilding your whole local stack
+  inside an image.
+- **`--host 0.0.0.0`, because a container cannot reach its host's loopback.**
+  `runlace serve` binds `127.0.0.1` by default and says so loudly when you widen
+  it: anything that can reach that port can run a stored workflow, and
+  `confirm=True` is one JSON field away. Do not do this on a shared network.
+- **No `mcpo` proxy.** Open WebUI speaks MCP streamable HTTP natively since
+  0.6.31, which is the transport `runlace serve --http` already speaks. A proxy
+  in between would rewrite the tool descriptions, and the descriptions *are* the
+  interface.
+
+The Mistral key is read out of your `.env` at the moment compose runs and passed
+through the environment; `chat_ui.sh` never writes it to a file. Point
+`MISTRAL_ENV_FILE` somewhere else if yours lives elsewhere.
+
 ## Development
 
 ```
@@ -356,6 +391,7 @@ uv run pyright                   # Runlace's own source and tests
 ./scripts/m6_acceptance.sh       # create -> dry run -> edit -> refuse -> confirm
 ./scripts/demo.sh                # the two-minute demo
 ./scripts/demo_agent.py          # let a local model write the workflow
+./scripts/chat_ui.sh up          # a chat UI on localhost:3000, see above
 ```
 
 Tests set `RUNLACE_HOME` to a temporary directory, so they never touch your

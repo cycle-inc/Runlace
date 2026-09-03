@@ -16,7 +16,7 @@ from mcp.types import CallToolResult
 
 from runlace.db import Connection
 from runlace.paths import RunlacePaths
-from runlace.server import build_server
+from runlace.server import build_server, serve
 
 INPUTS = {
     "type": "object",
@@ -401,3 +401,45 @@ def test_a_dry_run_is_not_stopped_by_the_confirm_gate(
     assert result["ok"] is True
     assert result["dry_run"] is True
     assert result["simulated"] == [{"connector": "gmail", "tool": "send_email"}]
+
+
+# -- the transport ---
+
+
+def test_serve_without_a_port_uses_stdio(
+    home: tuple[RunlacePaths, Connection], monkeypatch: Any
+) -> None:
+    """The default an MCP host launching `runlace serve` gets."""
+    paths, _ = home
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(MCPServer, "run", lambda self, **kw: seen.update(kw))
+
+    serve(paths)
+
+    assert seen == {"transport": "stdio"}
+
+
+def test_serve_with_a_port_stays_on_loopback_unless_told_otherwise(
+    home: tuple[RunlacePaths, Connection], monkeypatch: Any
+) -> None:
+    """Binding wider than loopback has to be asked for, never inferred."""
+    paths, _ = home
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(MCPServer, "run", lambda self, **kw: seen.update(kw))
+
+    serve(paths, port=8000)
+
+    assert seen == {"transport": "streamable-http", "host": "127.0.0.1", "port": 8000}
+
+
+def test_serve_binds_the_host_it_is_given(
+    home: tuple[RunlacePaths, Connection], monkeypatch: Any
+) -> None:
+    """What a Dockerised MCP client needs: a container cannot reach loopback."""
+    paths, _ = home
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(MCPServer, "run", lambda self, **kw: seen.update(kw))
+
+    serve(paths, port=8000, host="0.0.0.0")
+
+    assert seen["host"] == "0.0.0.0"

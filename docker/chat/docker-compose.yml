@@ -1,0 +1,42 @@
+# A chat UI to drive Runlace with, on localhost.
+#
+# Open WebUI speaks MCP over streamable HTTP natively (>= 0.6.31), which is the
+# transport `runlace serve --http` already speaks, so there is no proxy in
+# between and the tool descriptions the model reads are the ones in the source.
+#
+# Runlace itself stays OUT of this container on purpose. It launches your MCP
+# servers as local subprocesses (npx, uvx, whatever `runlace init` found) and
+# reads ~/.runlace; containerising it would mean rebuilding your whole local
+# stack inside an image. So: UI in Docker, Runlace on the host, the container
+# reaches it through host.docker.internal.
+#
+#   Terminal 1:  runlace serve --http 8000 --host 0.0.0.0
+#   Terminal 2:  ./scripts/chat_ui.sh up
+#
+# The API key is never written here. It comes from the environment, and
+# scripts/chat_ui.sh reads it out of your .env at the moment it runs compose.
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: runlace-chat
+    ports:
+      - "3000:8080"
+    environment:
+      # Mistral's API is OpenAI-compatible, so it plugs into the OpenAI slot.
+      - OPENAI_API_BASE_URL=https://api.mistral.ai/v1
+      - OPENAI_API_KEY=${MISTRAL_API_KEY:?run ./scripts/chat_ui.sh rather than compose directly}
+      # Nothing local to talk to, and leaving it on costs a slow probe per page.
+      - ENABLE_OLLAMA_API=false
+    extra_hosts:
+      # How the container reaches `runlace serve` on the host. Explicit because
+      # host-gateway is not wired up by default outside Docker Desktop.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Accounts, chats and the MCP server you register all live here. Delete
+      # the volume to start over; `chat_ui.sh reset` does exactly that.
+      - runlace-chat:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  runlace-chat:

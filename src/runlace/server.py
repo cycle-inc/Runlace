@@ -237,10 +237,22 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
     return server
 
 
-def serve(paths: RunlacePaths | None = None, *, port: int | None = None) -> None:
-    """Run the server on stdio, or over streamable HTTP when a port is given."""
+def serve(
+    paths: RunlacePaths | None = None,
+    *,
+    port: int | None = None,
+    host: str = "127.0.0.1",
+) -> None:
+    """Run the server on stdio, or over streamable HTTP when a port is given.
+
+    ``host`` stays on loopback unless you say otherwise. A container cannot
+    reach loopback on its host, so a Dockerised MCP client (Open WebUI,
+    LibreChat) needs ``0.0.0.0`` -- which also turns off the DNS-rebinding
+    protection the MCP SDK enables for localhost, because the client will send
+    a ``Host`` header this process has never heard of.
+    """
     server = build_server(paths)
     if port is None:
         server.run(transport="stdio")
     else:
-        server.run(transport="streamable-http", port=port)
+        server.run(transport="streamable-http", host=host, port=port)
