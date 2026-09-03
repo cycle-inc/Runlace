@@ -32,6 +32,20 @@ produces:
   workflows/
 ```
 
+Remote servers authenticate with static headers (D8). Write the secret as a
+reference and it stays a reference:
+
+```json
+{"github": {"type": "http", "url": "https://api.githubcopilot.com/mcp/",
+            "headers": {"Authorization": "Bearer ${GITHUB_PAT}"}}}
+```
+
+`${VAR}` is resolved from the environment when a connection is opened, so
+`config.json` holds the reference and never the token. A reference with nothing
+behind it is reported as `skipped (environment variable(s) not set: …)` rather
+than sent unsubstituted and answered with a puzzling 401. `command` is the one
+field left alone — it is a binary looked up on PATH.
+
 Tool names are kept verbatim from `tools/list`; the stubs carry the Python
 spelling alongside (`get-annotated-message` → `get_annotated_message`).
 Reserved words in parameters get a trailing underscore (`from` → `from_`) and
@@ -169,6 +183,11 @@ Two things M1 needs that `SPEC.md` does not pin down:
   four workflow tables, but D10 puts everything except workflow code in SQLite
   and M1 has to persist discovery. These two tables are additive; the four
   documented ones are unchanged.
+- **`${VAR}` in connector headers, args, env and url.** D8 allows remote
+  servers with static header auth, which would otherwise put a bearer token in
+  plaintext in `config.json`. The spec does not say where the secret should
+  live, so it lives in the environment and the config keeps a reference,
+  resolved at connection time.
 - **Schema-hash scope.** The per-tool hash covers `inputSchema` and
   `outputSchema` only. A server rewording a tool description will not
   invalidate stored workflows; changing a parameter will.

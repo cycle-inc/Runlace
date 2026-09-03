@@ -3,7 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from runlace.config import ImportResult, import_from_files, read_config, write_config
+import pytest
+
+from runlace.config import (
+    Connector,
+    ImportResult,
+    MissingEnvVars,
+    import_from_files,
+    read_config,
+    write_config,
+)
 
 from .conftest import FIXTURES
 
@@ -82,3 +91,87 @@ def test_config_round_trips(tmp_path: Path) -> None:
     target = tmp_path / "config.json"
     write_config(target, imported.connectors)
     assert read_config(target) == imported.connectors
+
+
+# -- ${VAR} expansion ------------------------------------------------------
+#
+# D8 allows remote servers with static header auth, so config.json would
+# otherwise hold a bearer token in plaintext. The reference is what gets stored;
+# the value is only ever read from the environment, when a connection opens.
+
+
+def http_connector(**overrides: object) -> Connector:
+    defaults: dict[str, object] = {
+        "name": "github",
+        "attr": "github",
+        "transport": "http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {"Authorization": "Bearer ${GITHUB_PAT}"},
+    }
+    return Connector(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+def test_a_header_reference_is_resolved_from_the_environment() -> None:
+    resolved = http_connector().resolved({"GITHUB_PAT": "ghp_secret"})
+    assert resolved.headers == {"Authorization": "Bearer ghp_secret"}
+
+
+def test_the_stored_config_keeps_the_reference_not_the_secret(tmp_path: Path) -> None:
+    """The whole point: the file on disk must never contain the token."""
+    target = tmp_path / "config.json"
+    write_config(target, [http_connector()])
+    text = target.read_text(encoding="utf-8")
+    assert "${GITHUB_PAT}" in text
+    assert "ghp_secret" not in text
+    assert read_config(target) == [http_connector()]
+
+
+def test_a_reference_with_nothing_behind_it_is_an_error() -> None:
+    """Better than sending `Bearer ${GITHUB_PAT}` and collecting a puzzling 401."""
+    with pytest.raises(MissingEnvVars) as raised:
+        http_connector().resolved({})
+    assert raised.value.names == ["GITHUB_PAT"]
+    assert "GITHUB_PAT" in str(raised.value)
+
+
+def test_every_missing_variable_is_reported_at_once() -> None:
+    connector = http_connector(
+        url="https://${HOST}/mcp/",
+        headers={"Authorization": "Bearer ${GITHUB_PAT}", "X-Org": "${ORG}"},
+    )
+    with pytest.raises(MissingEnvVars) as raised:
+        connector.resolved({"ORG": "cycle-inc"})
+    assert raised.value.names == ["HOST", "GITHUB_PAT"]
+
+
+def test_stdio_env_and_args_are_resolved_too() -> None:
+    connector = Connector(
+        name="local",
+        attr="local",
+        transport="stdio",
+        command="server",
+        args=["--project", "${PROJECT}"],
+        env={"TOKEN": "${TOKEN}"},
+    )
+    resolved = connector.resolved({"PROJECT": "vega", "TOKEN": "t"})
+    assert resolved.args == ["--project", "vega"]
+    assert resolved.env == {"TOKEN": "t"}
+
+
+def test_the_command_itself_is_left_alone() -> None:
+    """It is a binary looked up on PATH; substituting there would be a surprise."""
+    connector = Connector(
+        name="local", attr="local", transport="stdio", command="${EVIL}", args=[]
+    )
+    assert connector.resolved({}).command == "${EVIL}"
+
+
+def test_a_bare_dollar_name_is_not_a_reference() -> None:
+    """Only ${VAR}. A bare $VAR is too easy to write by accident in a URL."""
+    connector = http_connector(headers={"X-Cost": "$USD and $100"})
+    assert connector.resolved({"USD": "no"}).headers == {"X-Cost": "$USD and $100"}
+
+
+def test_a_connector_without_references_is_unchanged() -> None:
+    connector = http_connector(headers={"Authorization": "Bearer literal"})
+    assert connector.resolved({}) == connector

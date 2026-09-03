@@ -21,7 +21,7 @@ from mcp.client.stdio import get_default_environment, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import Tool
 
-from .config import Connector
+from .config import Connector, MissingEnvVars
 
 Status = Literal["connected", "skipped", "error"]
 
@@ -70,7 +70,14 @@ async def open_transport(connector: Connector) -> AsyncIterator[tuple[Any, Any]]
 
     Public because runs need it too: :mod:`runlace.sessions` opens a session per
     connector while a workflow executes.
+
+    ``${VAR}`` references are resolved here, at the last possible moment, so a
+    secret lives in the environment rather than in ``config.json``. A reference
+    with nothing behind it raises :class:`MissingEnvVars` rather than sending an
+    unsubstituted header and collecting a puzzling 401.
     """
+    connector = connector.resolved()
+
     if connector.transport == "stdio":
         assert connector.command is not None
         params = StdioServerParameters(
@@ -124,6 +131,10 @@ async def discover_one(
             tools = await _list_tools(connector)
     except asyncio.TimeoutError:
         return DiscoveryResult(connector, "error", f"timed out after {timeout:.0f}s")
+    except MissingEnvVars as exc:
+        # A configuration problem, not a server problem: the same category as
+        # the OAuth servers the spec has init list rather than fail on.
+        return DiscoveryResult(connector, "skipped", str(exc))
     except Exception as exc:  # noqa: BLE001 - one bad server must not stop init
         message = f"{type(exc).__name__}: {exc}".strip()
         if connector.transport != "stdio" and _looks_like_auth_failure(message):

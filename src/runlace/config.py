@@ -8,15 +8,46 @@ We read the ``mcpServers`` blocks written by Claude Code, Cursor and project
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import os
+import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from .naming import python_identifier
 
 Transport = Literal["stdio", "http", "sse"]
 
 CONFIG_VERSION = 1
+
+# D8 allows remote servers with static header auth, which means config.json would
+# otherwise hold a bearer token in plaintext. `${VAR}` is resolved from the
+# environment when a connection is opened, so the file keeps the reference and
+# never the secret. Only this spelling: a bare `$VAR` is too easy to write by
+# accident in a URL or an argument.
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+class MissingEnvVars(Exception):
+    """A connector referenced environment variables that are not set."""
+
+    def __init__(self, names: list[str]) -> None:
+        self.names = names
+        listed = ", ".join(names)
+        super().__init__(f"environment variable(s) not set: {listed}")
+
+
+def _expand(text: str, environ: Mapping[str, str], missing: list[str]) -> str:
+    def substitute(match: re.Match[str]) -> str:
+        name = match.group(1)
+        value = environ.get(name)
+        if value is None:
+            if name not in missing:
+                missing.append(name)
+            return match.group(0)
+        return value
+
+    return _ENV_REF.sub(substitute, text)
 
 
 @dataclass(frozen=True)
@@ -42,6 +73,31 @@ class Connector:
             data["url"] = self.url
             data["headers"] = self.headers
         return data
+
+    def resolved(self, environ: Mapping[str, str] | None = None) -> Connector:
+        """This connector with every ``${VAR}`` replaced by its value.
+
+        Called when a connection is opened, never before storing: the config
+        file is meant to keep the reference. ``command`` is left alone -- it is a
+        binary looked up on PATH, and a substitution there would be a surprise
+        rather than a convenience.
+        """
+        env = os.environ if environ is None else environ
+        missing: list[str] = []
+
+        def text(value: str) -> str:
+            return _expand(value, env, missing)
+
+        resolved = replace(
+            self,
+            args=[text(a) for a in self.args],
+            env={k: text(v) for k, v in self.env.items()},
+            url=text(self.url) if self.url is not None else None,
+            headers={k: text(v) for k, v in self.headers.items()},
+        )
+        if missing:
+            raise MissingEnvVars(missing)
+        return resolved
 
 
 @dataclass
