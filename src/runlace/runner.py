@@ -2,9 +2,10 @@
 
 The child runs the workflow in an isolated interpreter; this is the other end of
 its pipe. For every ``ctx.<attr>.<method>(**kwargs)`` it asks for, this module
-resolves the connector and the verbatim MCP tool name, maps renamed keyword
-arguments back to their JSON keys (``from_`` -> ``from``), performs the call
-through the injected ``call_tool``, and records a step.
+resolves the connector and the verbatim MCP tool name, translates the arguments
+out of the stubs' spelling and back into the schema's (``from_`` -> ``from``, at
+every level -- see :mod:`runlace.keys`), performs the call through the injected
+``call_tool``, records a step, and translates the result the other way.
 
 The MCP call itself is injected rather than imported so that the bridge can be
 tested without a live server, and so that the only module talking to MCP servers
@@ -26,7 +27,7 @@ from typing import Any, Awaitable, Callable
 
 from . import runner_shim
 from .db import Connection, find_tool_by_method
-from .naming import unmap_param_name
+from .keys import to_json_keys, to_python_keys
 
 RUNNER_FILENAME = "_runlace_runner.py"
 WORKFLOW_FILENAME = "workflow.py"
@@ -287,7 +288,7 @@ async def _respond(
 
     connector = str(row["connector"])
     tool = str(row["tool"])
-    payload = _to_json_keys(arguments, str(row["input_schema_json"]))
+    payload = to_json_keys(arguments, _schema(row["input_schema_json"]))
 
     started = perf_counter()
     result: Any = None
@@ -316,17 +317,22 @@ async def _respond(
 
     if error is not None:
         return _error(request_id, f"{connector}.{tool}: {error}")
-    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+    # The journal keeps both sides in the server's spelling -- it is the record
+    # of what went over the wire -- but the workflow gets back what its stub
+    # promised, so `from` becomes `from_` again on the way in.
+    answer = to_python_keys(result, _schema(row["output_schema_json"]))
+    return {"jsonrpc": "2.0", "id": request_id, "result": answer}
 
 
-def _to_json_keys(arguments: dict[str, Any], input_schema_json: str) -> dict[str, Any]:
-    """Undo the reserved-word renaming the stubs introduced (D2)."""
+def _schema(column: Any) -> dict[str, Any] | None:
+    """A schema column as a dict, or ``None`` if it is absent or unreadable."""
+    if not isinstance(column, str):
+        return None
     try:
-        properties = json.loads(input_schema_json).get("properties")
+        schema = json.loads(column)
     except json.JSONDecodeError:
-        properties = None
-    keys = list(properties) if isinstance(properties, dict) else []
-    return {unmap_param_name(str(name), keys): value for name, value in arguments.items()}
+        return None
+    return schema if isinstance(schema, dict) else None
 
 
 def _error(request_id: Any, message: str) -> dict[str, Any]:

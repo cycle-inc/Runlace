@@ -125,9 +125,17 @@ scope); it is lint's allowlist enforced a second time, where it is cheap.
 
 `ctx` is injected there. Every `ctx.<connector>.<tool>(**kwargs)` becomes one
 line of JSON-RPC over a private pipe; Runlace resolves it to the verbatim MCP
-tool name, maps `from_` back to `from`, performs the real call, and writes a
-`steps` row before answering. The child's stdout is pointed at stderr and its
-stdin at `/dev/null` first, so a stray `print` cannot corrupt the protocol.
+tool name, translates `from_` back to `from`, performs the real call, translates
+the result the other way, and writes a `steps` row before answering. The child's
+stdout is pointed at stderr and its stdin at `/dev/null` first, so a stray
+`print` cannot corrupt the protocol.
+
+That translation is schema-driven and goes all the way down, because the stubs
+rename at every level — `create_relations(relations=[{"from_": ...}])` has the
+reserved word inside a list item, not in the signature. `runlace.keys` walks the
+value alongside the schema and renames exactly what the stub generator renamed,
+in both directions: where the generator gives up and emits `dict[str, object]`,
+nothing is renamed, because nothing was promised.
 
 Every attempt is journaled, refusals included — `runs` and `steps` are the
 audit log, the debug trace and the foundation for v2 resume, so a refused run
@@ -202,6 +210,10 @@ And these in M3:
   in place, never recreated. A run is `running` while in flight.
   The one case with no row is a workflow or version that does not exist: there
   is nothing to attach a run to.
+- **The journal records both sides in the server's spelling.** A step is the
+  record of what went over the wire, so `payload` and `result` hold `from`, not
+  the `from_` the workflow wrote and read. The two stay consistent with each
+  other and with what the server saw.
 - **The `steps` in the response omit `payload` and `result`.** A step that read
   a thousand rows would drown the agent's context. Both are in the `steps`
   table, which is where a debug trace belongs.

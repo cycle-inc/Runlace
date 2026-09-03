@@ -25,8 +25,19 @@ _PRIMITIVES = {
     "null": "None",
 }
 
-# Guards against schemas that reference themselves through $ref.
-_MAX_DEPTH = 12
+# Guards against schemas that reference themselves through $ref. Public because
+# `keys` walks values along the same schemas and has to stop at the same place.
+MAX_DEPTH = 12
+
+
+def defs_of(schema: dict[str, Any], inherited: dict[str, Any]) -> dict[str, Any]:
+    """The ``$defs``/``definitions`` visible from *schema*, innermost winning."""
+    merged = dict(inherited)
+    for key in ("$defs", "definitions"):
+        local = schema.get(key)
+        if isinstance(local, dict):
+            merged.update(local)
+    return merged
 
 
 @dataclass
@@ -76,7 +87,7 @@ class TypeRenderer:
 
         required = schema.get("required")
         required_keys = set(required) if isinstance(required, list) else set()
-        resolved_defs = self._defs_of(schema, defs or {})
+        resolved_defs = defs_of(schema, defs or {})
 
         fields: list[Field] = []
         for key, subschema in properties.items():
@@ -126,20 +137,11 @@ class TypeRenderer:
         self._used_names.add(name)
         return name
 
-    @staticmethod
-    def _defs_of(schema: dict[str, Any], inherited: dict[str, Any]) -> dict[str, Any]:
-        merged = dict(inherited)
-        for key in ("$defs", "definitions"):
-            local = schema.get(key)
-            if isinstance(local, dict):
-                merged.update(local)
-        return merged
-
     def _render(self, schema: Any, hint: str, defs: dict[str, Any], depth: int) -> str:
-        if depth > _MAX_DEPTH or not isinstance(schema, dict) or not schema:
+        if depth > MAX_DEPTH or not isinstance(schema, dict) or not schema:
             return "object"
 
-        defs = self._defs_of(schema, defs)
+        defs = defs_of(schema, defs)
 
         ref = schema.get("$ref")
         if isinstance(ref, str):

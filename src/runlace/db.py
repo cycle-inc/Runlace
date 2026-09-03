@@ -344,7 +344,8 @@ def find_tool_by_method(
     return conn.execute(
         """
         SELECT c.name AS connector, t.name AS tool, t.risk AS risk,
-               t.input_schema_json AS input_schema_json
+               t.input_schema_json AS input_schema_json,
+               t.output_schema_json AS output_schema_json
         FROM tools t
         JOIN connectors c ON c.name = t.connector
         WHERE c.attr = ? AND t.method = ?

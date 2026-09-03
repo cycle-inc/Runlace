@@ -145,6 +145,116 @@ def test_reserved_word_arguments_are_mapped_back_to_their_json_keys(
     ]
 
 
+def register_relations_tool(conn: Connection) -> None:
+    """`create_relations` from @modelcontextprotocol/server-memory, verbatim.
+
+    Its reserved key sits inside a list of objects rather than in the signature,
+    which is the shape that made the top-level-only mapping wrong.
+    """
+    relation = {
+        "type": "object",
+        "properties": {
+            "from": {"type": "string"},
+            "to": {"type": "string"},
+            "relationType": {"type": "string"},
+        },
+        "required": ["from", "to", "relationType"],
+    }
+    input_schema = {
+        "type": "object",
+        "properties": {"relations": {"type": "array", "items": relation}},
+        "required": ["relations"],
+    }
+    output_schema = {
+        "type": "object",
+        "properties": {"relations": {"type": "array", "items": relation}},
+    }
+    insert_tool(
+        conn,
+        connector="pennylane",
+        name="create_relations",
+        method="create_relations",
+        description="Create relations between entities.",
+        input_schema=input_schema,
+        output_schema=output_schema,
+        annotations={},
+        schema_hash=schema_hash(input_schema, output_schema),
+        risk="side_effect",
+    )
+    conn.commit()
+
+
+def test_a_reserved_word_nested_in_a_list_is_mapped_on_the_way_out(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The stub declares `from_` inside the list item, so the server must get `from`."""
+    _, conn = home
+    register_relations_tool(conn)
+
+    recorder = Recorder({"create_relations": {"relations": []}})
+    outcome = run(
+        conn,
+        workflow(
+            "ctx.pennylane.create_relations(relations=["
+            '{"from_": "Alice", "to": "Runlace", "relationType": "maintains"}])\n'
+            "return {}"
+        ),
+        call_tool=recorder,
+    )
+    assert outcome.status == STATUS_COMPLETED
+    assert recorder.calls == [
+        (
+            "pennylane",
+            "create_relations",
+            {"relations": [{"from": "Alice", "to": "Runlace", "relationType": "maintains"}]},
+        )
+    ]
+
+
+def test_a_reserved_word_nested_in_a_result_is_mapped_on_the_way_in(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The stub promises `from_` on the way back too, so the subscript must work."""
+    _, conn = home
+    register_relations_tool(conn)
+
+    answer = {"relations": [{"from": "Alice", "to": "Runlace", "relationType": "maintains"}]}
+    outcome = run(
+        conn,
+        workflow(
+            "result = ctx.pennylane.create_relations(relations=[])\n"
+            'return {"who": [r["from_"] for r in result["relations"]]}'
+        ),
+        call_tool=Recorder({"create_relations": answer}),
+    )
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.output == {"who": ["Alice"]}
+
+
+def test_the_journal_records_both_sides_in_the_servers_spelling(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """A step is the record of what went over the wire, not of what Python saw."""
+    _, conn = home
+    register_relations_tool(conn)
+
+    answer = {"relations": [{"from": "Alice", "to": "Runlace", "relationType": "maintains"}]}
+    outcome = run(
+        conn,
+        workflow(
+            "ctx.pennylane.create_relations(relations=["
+            '{"from_": "Alice", "to": "Runlace", "relationType": "maintains"}])\n'
+            "return {}"
+        ),
+        call_tool=Recorder({"create_relations": answer}),
+    )
+    (step,) = outcome.steps
+    assert step.payload == {
+        "relations": [{"from": "Alice", "to": "Runlace", "relationType": "maintains"}]
+    }
+    assert step.result == answer
+
+
 def test_the_tool_name_on_the_wire_is_the_verbatim_mcp_one(
     home: tuple[RunlacePaths, Connection]
 ) -> None:
