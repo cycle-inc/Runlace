@@ -80,6 +80,23 @@ def test_create_workflow_declares_its_arguments(
     assert "outputs_schema" in schema["properties"]
 
 
+def test_the_no_inputs_spelling_is_written_down_where_an_agent_will_read_it(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """`inputs_schema` is required and non-null, so "no inputs" needs a spelling.
+
+    A model that sends `null` gets a Pydantic error out of the tool layer and no
+    compiler verdict at all -- there is no line, no hint, nothing to fix. The
+    empty object is the answer, and it has to appear in both places an agent
+    reads before it calls: the tool's own description and SKILL.md.
+    """
+    paths, _ = home
+    server = build_server(paths)
+    empty = '{"type": "object", "properties": {}}'
+    assert empty in (tools_of(server)["create_workflow"].description or "")
+    assert empty in call(server, "get_skill")["skill"]
+
+
 def test_get_skill_lists_the_connectors_and_their_stubs(
     home: tuple[RunlacePaths, Connection]
 ) -> None:
@@ -235,3 +252,22 @@ def test_running_an_unknown_workflow_says_what_to_do(
     assert result["ok"] is False
     assert result["code"] == "unknown-workflow"
     assert "list_workflows" in result["hint"]
+
+
+def test_a_workflow_with_no_inputs_compiles_with_the_empty_schema(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The spelling SKILL.md advertises has to actually be accepted."""
+    created = call(
+        build_server(home[0]),
+        "create_workflow",
+        name="no-inputs",
+        description="Reads the balance and nothing else.",
+        code=(
+            "from runlace_types import Ctx\n\n\n"
+            "def run(ctx: Ctx) -> dict[str, object]:\n"
+            '    return {"balance": ctx.pennylane.get_balance()}\n'
+        ),
+        inputs_schema={"type": "object", "properties": {}},
+    )
+    assert created["ok"] is True

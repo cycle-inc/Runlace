@@ -13,7 +13,9 @@ that code once and get it to compile.
    (the generated `.pyi` files). Read them: they are the ground truth for what
    you can call, and they are specific to this machine.
 2. **`create_workflow`** — send `name`, `description`, `code`, `inputs_schema`,
-   and `outputs_schema` if you want the return value checked. The code is
+   and `outputs_schema` if you want the return value checked. `inputs_schema` is
+   always an object and is never `null`; a workflow that reads nothing from
+   `ctx.inputs` declares `{"type": "object", "properties": {}}`. The code is
    compiled: linted, typechecked with pyright against those stubs, and its tool
    calls extracted and pinned. On failure you get the stage, the line number, an
    error code and a hint. Fix and send again — that is a normal part of the loop,

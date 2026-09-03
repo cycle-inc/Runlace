@@ -76,8 +76,9 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
         `name` is lowercase letters, digits, hyphens and underscores.
         `inputs_schema` is a JSON Schema for what the workflow reads from
         `ctx.inputs`; anything a user might vary between runs belongs there
-        rather than inline. Declare `outputs_schema` only if you also annotate
-        `run` as `-> Output`.
+        rather than inline. It is required and is never null: a workflow that
+        reads nothing declares {"type": "object", "properties": {}}. Declare
+        `outputs_schema` only if you also annotate `run` as `-> Output`.
 
         On failure returns {ok: false, stage, errors: [{line, message, hint}]};
         fix what it reports and call again. On success returns {ok: true,
