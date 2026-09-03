@@ -142,6 +142,13 @@ class _Checker:
         self.tree = tree
         self.outputs_declared = outputs_declared
         self.errors: list[LintError] = []
+        self._imports_output = any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == STUB_PACKAGE
+            and not node.level
+            and any(a.name == OUTPUT_TYPE and a.asname is None for a in node.names)
+            for node in tree.body
+        )
         self.parents: dict[ast.AST, ast.AST] = {}
         for node in ast.walk(tree):
             for child in ast.iter_child_nodes(node):
@@ -243,6 +250,56 @@ class _Checker:
                 f"`{OUTPUT_TYPE}` is generated from your outputs_schema, so pyright "
                 f"checks the value you return against it.",
             )
+            return
+
+        self._check_output_is_the_generated_one()
+
+    def _check_output_is_the_generated_one(self) -> None:
+        """`-> Output` has to mean *our* Output, or D7 checks nothing.
+
+        A workflow that writes its own `class Output(TypedDict)` annotates `run`
+        with a type it invented, pyright happily checks the return value against
+        that, and the outputs_schema is never enforced until Pydantic rejects
+        the result after the side effects have already happened.
+        """
+        own = self._own_binding(OUTPUT_TYPE)
+        if own is not None:
+            self.add(
+                own,
+                E_OUTPUT_ANNOTATION,
+                f"`{OUTPUT_TYPE}` is defined in the workflow, shadowing the one "
+                f"generated from outputs_schema",
+                f"Delete it and write `from {STUB_PACKAGE} import Ctx, "
+                f"{OUTPUT_TYPE}`. Runlace generates `{OUTPUT_TYPE}` from the "
+                f"outputs_schema you declared; a local one means pyright checks "
+                f"your return value against a shape nobody agreed to.",
+            )
+            return
+
+        if not self._imports_output:
+            self.add(
+                self.tree.body[0] if self.tree.body else self.tree,
+                E_OUTPUT_ANNOTATION,
+                f"`{OUTPUT_TYPE}` is used but never imported from `{STUB_PACKAGE}`",
+                f"Add `from {STUB_PACKAGE} import Ctx, {OUTPUT_TYPE}` at the top "
+                f"of the file.",
+            )
+
+    def _own_binding(self, name: str) -> ast.AST | None:
+        """A top-level statement in the workflow that binds ``name`` itself."""
+        for node in self.tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name == name:
+                    return node
+            elif isinstance(node, ast.Assign):
+                if any(
+                    isinstance(t, ast.Name) and t.id == name for t in node.targets
+                ):
+                    return node
+            elif isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Name) and node.target.id == name:
+                    return node
+        return None
 
     # -- imports ---------------------------------------------------------
 

@@ -240,8 +240,9 @@ _TYPECHECK_HINTS = {
 
 _TYPECHECK_DEFAULT_HINT = (
     "pyright checked the workflow in strict mode against the generated stubs. "
-    "Fix the reported line; tools with no output schema return `object`, so "
-    "narrow them before use."
+    "Fix the reported line. Strict mode also refuses values whose type it "
+    "cannot infer: annotate the accumulator you build in a loop, or use a "
+    "comprehension."
 )
 
 

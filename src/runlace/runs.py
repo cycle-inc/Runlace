@@ -20,6 +20,7 @@ from typing import Any
 from .config import Connector, read_config
 from .db import Connection, finish_run, insert_run, insert_step
 from .paths import RunlacePaths
+from .policy import Policy, read_policy
 from .runner import (
     DEFAULT_TIMEOUT_SECONDS,
     STATUS_COMPLETED,
@@ -126,7 +127,19 @@ async def run_workflow(
         )
 
     # 3. confirm (D6)
-    side_effects = [t for t in record["tools_used"] if t.get("risk") != "read_only"]
+    #
+    # The risk pinned on the version is what the tool was when the workflow was
+    # compiled. `policy.yaml` may have been edited since, and an edit that marks
+    # a tool dangerous has to reach workflows that already exist -- otherwise
+    # the override protects nothing you already built. It only ever tightens:
+    # relaxing a pinned `side_effect` would need a new version, which is the
+    # safe direction to require paperwork in.
+    policy = read_policy(paths.policy)
+    side_effects = [
+        t
+        for t in record["tools_used"]
+        if _effective_risk(policy, t) != "read_only"
+    ]
     if side_effects and not confirm:
         names = ", ".join(f"{t['connector']}.{t['tool']}" for t in side_effects)
         return refuse(
@@ -300,6 +313,15 @@ def _connectors_for(
 
 def _summarise(errors: list[FieldError], prefix: str) -> str:
     return f"{prefix}: " + "; ".join(str(e) for e in errors)
+
+
+def _effective_risk(policy: Policy, pinned: dict[str, Any]) -> str:
+    """The stricter of what was pinned and what `policy.yaml` says now."""
+    if pinned.get("risk") != "read_only":
+        return "side_effect"
+    return policy.risk_for(
+        str(pinned.get("connector", "")), str(pinned.get("tool", "")), "read_only"
+    )
 
 
 def _drift_message(drift: dict[str, Any]) -> str:

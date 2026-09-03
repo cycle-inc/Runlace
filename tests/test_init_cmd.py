@@ -10,6 +10,7 @@ from runlace.config import Connector
 from runlace.discovery import DiscoveredTool, DiscoveryResult
 from runlace.init_cmd import ConnectorRow, format_table, plan_connector, run_init
 from runlace.paths import RunlacePaths
+from runlace.policy import Policy
 
 from .conftest import FIXTURES
 
@@ -43,6 +44,18 @@ def test_plan_applies_risk_classification() -> None:
     assert {p.tool.name: p.risk for p in planned} == {
         "read": "read_only",
         "write": "side_effect",
+    }
+
+
+def test_plan_lets_policy_override_the_classification() -> None:
+    """The override has to land here, before the risk is written and pinned."""
+    policy = Policy(risk={"srv": {"write": "read_only", "read": "side_effect"}})
+    _, planned = plan_connector(
+        result(tool("read", {"readOnlyHint": True}), tool("write")), [], policy
+    )
+    assert {p.tool.name: p.risk for p in planned} == {
+        "read": "side_effect",
+        "write": "read_only",
     }
 
 
@@ -107,6 +120,16 @@ def test_rerunning_init_with_fewer_servers_prunes_the_old_ones(paths: RunlacePat
     finally:
         conn.close()
     assert names == ["only"]
+
+
+def test_init_reports_a_policy_override_that_names_nothing(paths: RunlacePaths) -> None:
+    """The typo has to be visible at init; nothing later will mention it."""
+    paths.create()
+    paths.policy.write_text("risk:\n  ghub:\n    search: read_only\n", encoding="utf-8")
+
+    report = run_init(paths, [FIXTURES / "claude_config.json"], timeout=1.0)
+
+    assert any("risk.ghub.search matches no known tool" in w for w in report.warnings)
 
 
 def test_format_table_aligns_and_includes_status() -> None:

@@ -16,6 +16,7 @@ from .discovery import DEFAULT_TIMEOUT_SECONDS, DiscoveredTool, DiscoveryResult,
 from .hashing import schema_hash
 from .naming import python_identifier
 from .paths import RunlacePaths
+from .policy import EMPTY, Policy, read_policy, unknown_targets
 from .risk import classify
 
 
@@ -56,7 +57,7 @@ class _PlannedTool:
 
 
 def plan_connector(
-    result: DiscoveryResult, warnings: list[str]
+    result: DiscoveryResult, warnings: list[str], policy: Policy = EMPTY
 ) -> tuple[stubs.ConnectorSpec, list[_PlannedTool]]:
     """Decide method names, risk and hashes. Pure: touches nothing."""
     connector = result.connector
@@ -74,7 +75,7 @@ def plan_connector(
             continue
         used_methods.add(method)
 
-        risk = classify(tool.annotations)
+        risk = policy.risk_for(connector.name, tool.name, classify(tool.annotations))
         planned.append(
             _PlannedTool(
                 tool=tool,
@@ -140,14 +141,21 @@ def run_init(
     connectors: list[Connector] = imported.connectors
     write_config(paths.config, connectors)
 
+    policy = read_policy(paths.policy)
+    report.warnings.extend(policy.warnings)
+
     results = asyncio.run(discover_all(connectors, timeout=timeout))
 
     conn = db.connect(paths.db)
     try:
         db.prune_connectors(conn, [c.name for c in connectors])
         specs: list[stubs.ConnectorSpec] = []
+        seen: set[tuple[str, str]] = set()
         for result in results:
-            spec, planned = plan_connector(result, report.warnings)
+            spec, planned = plan_connector(result, report.warnings, policy)
+            for item in planned:
+                seen.add((result.connector.name, item.tool.name))
+                seen.add((result.connector.name, item.method))
             _write_connector(conn, result, planned)
             # Only servers we could reach get a stub; a stub for an unreachable
             # server would let a workflow typecheck against tools we never saw.
@@ -163,6 +171,9 @@ def run_init(
                     else f"{result.status} ({result.detail})",
                 )
             )
+        # A typo here fails silently and in the dangerous direction: you believe
+        # a tool is gated and it is not.
+        report.warnings.extend(unknown_targets(policy, seen))
         conn.commit()
     finally:
         conn.close()

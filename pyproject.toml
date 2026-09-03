@@ -8,9 +8,11 @@ dependencies = [
     "mcp>=2.1",
     "pydantic>=2.7",
     "pyright>=1.1.390",
+    "pyyaml>=6.0.3",
     "typer>=0.12",
     # TypedDicts built at run time must come from typing_extensions for pydantic
     # to validate them on Python 3.11.
+    "types-pyyaml>=6.0.12.20260815",
     "typing-extensions>=4.12",
 ]
 

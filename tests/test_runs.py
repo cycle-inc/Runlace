@@ -214,6 +214,55 @@ def test_a_read_only_workflow_needs_no_confirmation(
     assert result["output"] == {"balance": {"balance": 1234.5}, "to": "a@b.c"}
 
 
+def test_a_policy_edit_gates_a_workflow_that_already_exists(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """An override that only protects workflows written after it protects little.
+
+    `get_balance` is annotated read_only, so this workflow was stored ungated.
+    Marking it a side effect in `policy.yaml` has to reach it without recreating
+    it -- that is the whole point of noticing a tool is dangerous.
+    """
+    paths, _ = home
+    store(home, READ_ONLY, name="balance")
+    assert execute(home, workflow="balance")["ok"] is True
+
+    paths.policy.write_text(
+        "risk:\n  pennylane:\n    get_balance: side_effect\n", encoding="utf-8"
+    )
+
+    refused = execute(home, workflow="balance")
+    assert refused["code"] == CODE_NEEDS_CONFIRMATION
+    assert refused["side_effects"] == [{"connector": "pennylane", "tool": "get_balance"}]
+    assert execute(home, workflow="balance", confirm=True)["ok"] is True
+
+
+def test_a_policy_edit_cannot_ungate_a_workflow_that_already_exists(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """Overrides tighten in place and loosen only through a new version.
+
+    Relaxing is the direction where being wrong costs something, so it is the
+    direction that has to go through create_workflow again.
+    """
+    paths, _ = home
+    store(home)
+    paths.policy.write_text(
+        "risk:\n  gmail:\n    send_email: read_only\n", encoding="utf-8"
+    )
+    assert execute(home)["code"] == CODE_NEEDS_CONFIRMATION
+
+
+def test_a_broken_policy_file_does_not_stop_a_run(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """It must fail toward the gate, not toward the exception."""
+    paths, _ = home
+    store(home, READ_ONLY, name="balance")
+    paths.policy.write_text("risk:\n  - [unclosed\n", encoding="utf-8")
+    assert execute(home, workflow="balance")["ok"] is True
+
+
 def test_the_reported_steps_leave_the_data_in_the_journal(
     home: tuple[RunlacePaths, Connection]
 ) -> None:

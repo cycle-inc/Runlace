@@ -7,7 +7,7 @@ See `SPEC.md` for the full design. It is committed verbatim and still uses the
 working name `harness` throughout; everything in this repo has since been
 renamed to Runlace, including the on-disk names D2 and D10 spell out.
 
-**This repo currently implements M1, M2 and M3.**
+**This repo currently implements M1, M2, M3 and M4.**
 
 ## M1 — skeleton & discovery
 
@@ -157,8 +157,75 @@ still gets a `run_id` you can show a human.
 
 ### Not in M3
 
-`runlace sync` and the full SKILL.md are M4; `get_skill` still returns an M2
-primer. Resume, scheduling and streaming progress are v2.
+`runlace sync` and the full SKILL.md are M4. Resume, scheduling and streaming
+progress are v2.
+
+### Known gap: a compiled workflow can still guess a shape wrong
+
+"If it compiles, it runs" is true for servers that declare an `outputSchema`,
+and only partly true for those that do not — GitHub declares none on any of its
+47 tools. Those calls are typed `Any`, so pyright cannot check what the workflow
+does with the result, and no amount of type-system work can: nothing was
+promised. Handing a model the tasks in `blind_test` produced exactly one runtime
+failure of this kind, a `for` loop over a value that was a dict rather than the
+expected list. It passed all four compiler stages.
+
+Two fixes, attacking different halves. The first shipped in M4:
+
+1. **Let the agent look before it writes.** SKILL.md tells it that when a tool's
+   response shape is unclear it may call that tool itself to inspect the real
+   answer — restricted to tools classified `read_only`, so looking cannot act.
+   This needs no new machinery and addresses the cause: the model was guessing
+   when it could have checked.
+2. **A dry run.** Execute the workflow once before storing it and refuse to
+   store one that crashes, turning "compiles" into "has actually run". Stronger,
+   but structurally partial: D6 means a workflow that touches a side-effecting
+   tool cannot be rehearsed, so the guarantee would be two-tier. It also needs
+   sample inputs and makes creation slow and network-dependent.
+
+The second is not in `SPEC.md`, and D3 enumerates the compiler as four stages.
+Adding a fifth is a change to a locked decision, so it needs to be either an
+explicit extension of D3 or a separate `dry_run_workflow` tool outside the
+compiler. That call has not been made.
+
+## M4 — the skill and the policy
+
+`get_skill` now returns the real `SKILL.md` (`src/runlace/SKILL.md`, shipped
+with the package) instead of a primer: the calling convention, the file
+contract, the lint codes and three worked examples, alongside this machine's
+connector index and its generated stubs.
+
+Every workflow in that document is compiled by `tests/test_skill_examples.py`,
+and the lint codes its table advertises are checked against the codes that
+actually exist. A skill file that teaches something the compiler rejects is
+worse than none at all — the agent follows it, gets an error, and cannot tell
+which of the two is wrong — so the suite goes red before that can ship.
+
+### `policy.yaml`
+
+D5 treats an unannotated tool as a side effect. That is the right default and it
+is also unusable on a server that annotates nothing: the confirm gate fires on
+every run, which is the same as it never firing. `~/.runlace/policy.yaml` is the
+release valve.
+
+```yaml
+risk:
+  github:
+    search_repositories: read_only
+    create_issue: side_effect
+```
+
+Nothing in that file can take down `init` or a run. Unreadable, malformed, or
+holding a value that is not a risk — each becomes a warning and the rest is
+still applied, because "your override was ignored" is easier to recover from
+than "nothing works". An override that matches no tool on this machine is
+reported at `init`, since that typo fails in the dangerous direction: you
+believe a tool is gated and it is not.
+
+### Not in M4
+
+`runlace sync` as a command; the dry run described above. Resume, scheduling and
+streaming progress are v2.
 
 ## Development
 
@@ -170,6 +237,7 @@ uv run pyright                   # Runlace's own source and tests
 ./scripts/m1_acceptance.sh       # the M1 acceptance criterion, end to end
 ./scripts/m2_acceptance.sh       # the M2 acceptance criteria, end to end
 ./scripts/m3_acceptance.sh       # the M3 acceptance criterion, end to end
+./scripts/m4_acceptance.sh       # the M4 acceptance criterion, end to end
 ```
 
 Tests set `RUNLACE_HOME` to a temporary directory, so they never touch your
@@ -268,3 +336,33 @@ And these in M3:
 - **Sessions are opened up front**, one per connector the workflow uses, before
   any workflow code runs. A server that is down fails the run before the first
   side effect rather than halfway through.
+
+And these in M4:
+
+- **`pyyaml` is a dependency D9 does not list.** D9 enumerates the stack and
+  names no YAML parser, but D5 puts the risk overrides in `policy.yaml` and
+  `SPEC.md` keeps "policy beyond risk-override yaml" out of scope — so the yaml
+  itself is in. Writing a parser rather than adding the one everybody already
+  has would be the worse reading of a locked decision.
+- **A policy edit only ever tightens an existing workflow.** The risk pinned on
+  a version is what the tool was when it compiled; `policy.yaml` may have been
+  edited since. The confirm gate takes the stricter of the two, so marking a
+  tool dangerous reaches workflows that already exist — otherwise the override
+  protects nothing you have already built. It cannot go the other way: relaxing
+  a pinned `side_effect` needs a new version, which is the safe direction to
+  require paperwork in.
+- **Both spellings of a tool name are accepted** in `policy.yaml`. The server
+  says `get-annotated-message` and the stub the user is reading says
+  `get_annotated_message`; making them discover which one this file wanted
+  would be a trap with a silent failure at the end of it.
+- **A workflow may not define its own `Output`.** Found while reviewing error
+  messages for M4: a `class Output(TypedDict)` in the workflow file is not a
+  redefinition of anything — pyright type-checks the return value against the
+  invented shape, happily, and `outputs_schema` goes unenforced until Pydantic
+  rejects the result *after* the side effects have happened. Lint now requires
+  `Output` to come from `runlace_types` when `outputs_schema` is declared.
+- **Read-only probing is guidance in SKILL.md, not a tool.** The agent is told
+  it may call a tool itself to learn the shape of its response, and only one
+  classified `read_only`. Runlace does not proxy that call: a `call_tool` on
+  this server would be a way around the gate it exists to enforce, and the agent
+  already has its own client.

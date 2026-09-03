@@ -227,6 +227,32 @@ def test_output_annotation_satisfies_the_outputs_rule() -> None:
     assert lint(code, outputs_declared=True) == []
 
 
+def test_a_workflow_cannot_bring_its_own_output_type() -> None:
+    """Otherwise D7 checks the return value against a shape nobody agreed to.
+
+    pyright is perfectly happy with a locally defined `Output`, so the outputs
+    schema goes unenforced until Pydantic rejects the result -- after the side
+    effects have happened.
+    """
+    code = (
+        "from runlace_types import Ctx\n"
+        "from typing import TypedDict\n\n\n"
+        "class Output(TypedDict):\n    count: str\n\n\n"
+        'def run(ctx: Ctx) -> Output:\n    return {"count": "x"}\n'
+    )
+    errors = lint(code, outputs_declared=True)
+    assert [e.code for e in errors] == [E_OUTPUT_ANNOTATION]
+    assert errors[0].line == 5  # the class, which is what has to go
+    assert "shadowing" in errors[0].message
+
+
+def test_the_output_type_has_to_be_imported() -> None:
+    code = "from runlace_types import Ctx\n\n\ndef run(ctx: Ctx) -> Output:\n    return {}\n"
+    errors = lint(code, outputs_declared=True)
+    assert [e.code for e in errors] == [E_OUTPUT_ANNOTATION]
+    assert "never imported" in errors[0].message
+
+
 # -- shape of the errors ---------------------------------------------------
 
 
