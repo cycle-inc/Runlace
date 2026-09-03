@@ -19,6 +19,7 @@ from .paths import RunlacePaths, paths as default_paths
 from .runs import run_workflow as _run_workflow
 from .skill import build_skill
 from .workflows import create_workflow as _create_workflow
+from .workflows import edit_workflow as _edit_workflow
 from .workflows import get_workflow as _get_workflow
 from .workflows import list_workflows as _list_workflows
 
@@ -27,8 +28,9 @@ SERVER_NAME = "runlace"
 INSTRUCTIONS = """\
 Runlace stores deterministic, replayable workflows over this machine's MCP
 servers. Call get_skill first: it returns the calling convention and the exact
-connectors and tools available here. Then create_workflow with the code, and
-run_workflow to execute it.
+connectors and tools available here. Then create_workflow with the code,
+dry_run_workflow to check it really works, edit_workflow to fix what it turns
+up, and run_workflow to execute it for real.
 """
 
 
@@ -98,6 +100,48 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
         return result.to_json()
 
     @server.tool()
+    def edit_workflow(
+        name: str,
+        old_string: str,
+        new_string: str,
+        description: str | None = None,
+        inputs_schema: dict[str, Any] | None = None,
+        outputs_schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Change one exact string in a workflow's code, and recompile it.
+
+        Use this instead of create_workflow whenever you are fixing existing
+        code: sending the whole file back to change one line is where most of
+        the mistakes come from. Call get_workflow first and copy `old_string`
+        out of the code you get back, exactly as it appears, indentation
+        included.
+
+        `old_string` must match once and only once -- include the surrounding
+        lines until it does. Runlace will not guess which occurrence you meant.
+
+        The schemas and the description carry over from the version you edited;
+        pass one only to change it. The result is a NEW immutable version, same
+        as create_workflow: the previous one stays readable and runnable.
+
+        On failure returns {ok: false, stage, errors: [{message, hint, code}]}
+        with `code` one of unknown-workflow, missing-code, no-change, no-match,
+        not-unique -- or the usual lint/typecheck errors if the edited code no
+        longer compiles.
+        """
+        with session() as conn:
+            result = _edit_workflow(
+                conn,
+                home,
+                name=name,
+                old_string=old_string,
+                new_string=new_string,
+                description=description,
+                inputs_schema=inputs_schema,
+                outputs_schema=outputs_schema,
+            )
+        return result.to_json()
+
+    @server.tool()
     def list_workflows() -> dict[str, Any]:
         """List every stored workflow: name, description, latest version, last run."""
         with session() as conn:
@@ -153,6 +197,40 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
                 workflow=workflow_id,
                 inputs=inputs,
                 confirm=confirm,
+                version=version,
+            )
+
+    @server.tool()
+    async def dry_run_workflow(
+        workflow_id: str,
+        inputs: dict[str, Any] | None = None,
+        version: str | None = None,
+    ) -> dict[str, Any]:
+        """Run a workflow for real, but let nothing act on the world.
+
+        This is how you check a workflow before you tell a human it works.
+        Compiling proves the calls have the right shape; only running proves the
+        code survives what the tools actually return.
+
+        Every read hits the live server and gets the real answer. Every tool
+        that acts -- anything Runlace calls a side effect -- is answered from its
+        own declared output shape instead of being called, so nothing is sent,
+        created or deleted. There is no confirm gate here, because there is
+        nothing to confirm.
+
+        Same result as run_workflow, plus {dry_run: true, simulated: [...]}.
+        `simulated` is the list of calls that were stood in for: a branch that
+        depends on what one of them really returns is the one thing this cannot
+        check, so read it before trusting the output. The run is journaled like
+        any other, and marked so it never counts as "this workflow last ran".
+        """
+        with session() as conn:
+            return await _run_workflow(
+                conn,
+                home,
+                workflow=workflow_id,
+                inputs=inputs,
+                dry_run=True,
                 version=version,
             )
 

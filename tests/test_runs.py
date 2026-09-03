@@ -27,7 +27,7 @@ from runlace.runs import (
     CODE_WORKFLOW_FAILED,
     run_workflow,
 )
-from runlace.workflows import create_workflow
+from runlace.workflows import create_workflow, list_workflows
 
 INPUTS = {
     "type": "object",
@@ -103,6 +103,7 @@ def execute(
     inputs: dict[str, Any] | None = None,
     confirm: bool = False,
     version: str | None = None,
+    dry_run: bool = False,
     call_tool: Any = None,
 ) -> dict[str, Any]:
     paths, conn = home
@@ -114,6 +115,7 @@ def execute(
             inputs=inputs if inputs is not None else {"to": "a@b.c"},
             confirm=confirm,
             version=version,
+            dry_run=dry_run,
             call_tool=call_tool or Recorder(),
             timeout=30.0,
         )
@@ -545,3 +547,138 @@ def test_a_workflow_can_be_addressed_by_name_or_by_id(
     assert created.ok and created.workflow_id is not None
     workflow = created.workflow_id if key == "by-id" else "report"
     assert execute(home, workflow=workflow)["ok"] is True
+
+
+# -- the dry run -----------------------------------------------------------
+
+
+def test_a_dry_run_reads_for_real_and_never_lets_a_tool_act(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The bargain the whole feature rests on, in one assertion each way."""
+    store(home)
+    recorder = Recorder()
+    result = execute(home, dry_run=True, call_tool=recorder)
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["simulated"] == [{"connector": "gmail", "tool": "send_email"}]
+    # The reads really happened; the send never reached the wire.
+    assert [t for _, t, _ in recorder.calls] == ["get_balance", "list_transactions"]
+    assert result["output"] == {"balance": {"balance": 1234.5}, "count": 1}
+
+
+def test_a_dry_run_needs_no_confirmation(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """D6 gates acting on the world. A dry run does not act on the world."""
+    store(home)
+    assert execute(home)["code"] == CODE_NEEDS_CONFIRMATION
+    assert execute(home, dry_run=True)["ok"] is True
+
+
+def test_a_stood_in_value_has_the_shape_the_server_declared(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The point of standing in from `outputSchema` rather than returning None.
+
+    `list_transactions` is read-only in the fixture, so `policy.yaml` is used to
+    make it act -- and then the line after it, `len(txs["transactions"])`, has to
+    keep working on a value nobody fetched.
+    """
+    paths, _ = home
+    store(home)
+    paths.policy.write_text(
+        "risk:\n  pennylane:\n    list_transactions: side_effect\n", encoding="utf-8"
+    )
+
+    recorder = Recorder()
+    result = execute(home, dry_run=True, call_tool=recorder)
+
+    assert result["ok"] is True
+    assert [t for _, t, _ in recorder.calls] == ["get_balance"]
+    # One element, so the loop body runs once and the length is countable.
+    assert result["output"]["count"] == 1
+
+
+def test_a_dry_run_is_journaled_and_marked_as_one(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """It has to be in the audit log, and it has to be impossible to mistake."""
+    _, conn = home
+    store(home)
+    result = execute(home, dry_run=True)
+
+    row, steps = journal(conn, result["run_id"])
+    assert row["status"] == "completed"
+    assert row["dry_run"] == 1
+    # The stood-in call is a step like any other: it is what the workflow did.
+    assert [s["tool"] for s in steps] == [
+        "get_balance",
+        "list_transactions",
+        "send_email",
+    ]
+
+
+def test_a_dry_run_does_not_count_as_the_last_run(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """"When did this last run" is a question about the world."""
+    _, conn = home
+    store(home)
+    execute(home, dry_run=True)
+    assert list_workflows(conn)[0]["last_run"] is None
+
+    execute(home, confirm=True)
+    assert list_workflows(conn)[0]["last_run"]["status"] == "completed"
+
+
+def test_a_dry_run_does_not_need_the_connector_it_never_calls(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """You can check a workflow before the server that would act is reachable."""
+    paths, _ = home
+    store(home)
+    paths.config.write_text(
+        json.dumps(
+            {"connectors": {"pennylane": {"command": "pennylane", "args": []}}}
+        ),
+        encoding="utf-8",
+    )
+
+    assert execute(home, confirm=True)["code"] == CODE_UNKNOWN_CONNECTOR
+    assert execute(home, dry_run=True)["ok"] is True
+
+
+def test_a_dry_run_still_validates_its_inputs(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """Only the confirm gate is lifted; the rest of the order is the same."""
+    store(home)
+    assert execute(home, inputs={}, dry_run=True)["code"] == CODE_INVALID_INPUTS
+
+
+def test_a_dry_run_that_returns_the_wrong_shape_says_nothing_acted(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The same defect reads differently when the side effects have not happened."""
+    store(home, ANNOTATED, name="statement", outputs_schema=OUTPUTS)
+    real = execute(
+        home,
+        workflow="statement",
+        call_tool=Recorder(
+            {"list_transactions": {"transactions": [{"id": "a", "amount": "lots"}]}}
+        ),
+    )
+    dry = execute(
+        home,
+        workflow="statement",
+        dry_run=True,
+        call_tool=Recorder(
+            {"list_transactions": {"transactions": [{"id": "a", "amount": "lots"}]}}
+        ),
+    )
+
+    assert real["code"] == dry["code"] == CODE_INVALID_OUTPUT
+    assert "side effects happened" in real["hint"]
+    assert "Nothing acted" in dry["hint"]

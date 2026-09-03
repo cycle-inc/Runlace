@@ -18,7 +18,13 @@ import uuid
 from typing import Any
 
 from .config import Connector, read_config
-from .db import Connection, finish_run, insert_run, insert_step
+from .db import (
+    Connection,
+    finish_run,
+    insert_run,
+    insert_step,
+    tool_output_schemas,
+)
 from .paths import RunlacePaths
 from .policy import Policy, read_policy
 from .runner import (
@@ -30,6 +36,7 @@ from .runner import (
     run_code,
 )
 from .sessions import open_sessions
+from .simulate import stand_in
 from .validation import FieldError, apply_defaults, validate
 from .workflows import get_workflow
 
@@ -52,10 +59,17 @@ async def run_workflow(
     inputs: dict[str, Any] | None = None,
     confirm: bool = False,
     version: str | None = None,
+    dry_run: bool = False,
     call_tool: CallTool | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Run one stored workflow. Returns a result; it does not raise for failures.
+
+    ``dry_run`` executes the workflow for real -- every read hits the live
+    server, every branch is taken, the return value is validated -- but answers
+    each side-effecting call from the tool's own ``outputSchema`` instead of
+    letting it act. Nothing leaves the machine, so there is no confirmation gate
+    on it; every other gate still applies.
 
     ``call_tool`` is injectable so tests can run a real subprocess against fake
     tools. Left unset, sessions are opened to the connectors the workflow uses.
@@ -95,13 +109,16 @@ async def run_workflow(
         workflow_version_id=str(record["version_id"]),
         inputs=resolved,
         confirmed=confirm,
+        dry_run=dry_run,
     )
     conn.commit()
 
     def refuse(code: str, error: str, hint: str, **extra: Any) -> dict[str, Any]:
         finish_run(conn, run_id, status=STATUS_FAILED, error=error)
         conn.commit()
-        return _refused(run_id, code, error, hint, record=record, **extra)
+        return _refused(
+            run_id, code, error, hint, record=record, dry_run=dry_run, **extra
+        )
 
     # 1. inputs
     input_errors = validate(record.get("inputs_schema"), resolved)
@@ -140,7 +157,7 @@ async def run_workflow(
         for t in record["tools_used"]
         if _effective_risk(policy, t) != "read_only"
     ]
-    if side_effects and not confirm:
+    if side_effects and not confirm and not dry_run:
         names = ", ".join(f"{t['connector']}.{t['tool']}" for t in side_effects)
         return refuse(
             CODE_NEEDS_CONFIRMATION,
@@ -154,7 +171,20 @@ async def run_workflow(
         )
 
     # 4. run
-    connectors, missing = _connectors_for(paths, record["tools_used"])
+    #
+    # In a dry run the side-effecting tools are never called, so the servers
+    # that only host them are never needed either -- you can dry-run a workflow
+    # before the connector that would send the email is even reachable.
+    simulated = [
+        {"connector": str(t["connector"]), "tool": str(t["tool"])} for t in side_effects
+    ]
+    needed = [
+        t
+        for t in record["tools_used"]
+        if not dry_run
+        or {"connector": str(t["connector"]), "tool": str(t["tool"])} not in simulated
+    ]
+    connectors, missing = _connectors_for(paths, needed)
     if missing:
         return refuse(
             CODE_UNKNOWN_CONNECTOR,
@@ -180,12 +210,14 @@ async def run_workflow(
         )
         conn.commit()
 
+    stand_ins = _stand_ins(conn, simulated) if dry_run else {}
+
     if call_tool is not None:
         outcome = await run_code(
             conn,
             code=code,
             inputs=resolved,
-            call_tool=call_tool,
+            call_tool=_without_side_effects(call_tool, stand_ins),
             on_step=journal,
             timeout=timeout,
         )
@@ -196,7 +228,7 @@ async def run_workflow(
                     conn,
                     code=code,
                     inputs=resolved,
-                    call_tool=sessions.call,
+                    call_tool=_without_side_effects(sessions.call, stand_ins),
                     on_step=journal,
                     timeout=timeout,
                 )
@@ -210,6 +242,12 @@ async def run_workflow(
             )
 
     steps = [s.to_json() for s in outcome.steps]
+    # Every result from here on says whether it was a dry run and, if it was,
+    # exactly which calls were answered rather than made. A caller must never
+    # have to infer that from the risk column.
+    kind: dict[str, Any] = (
+        {"dry_run": True, "simulated": simulated} if dry_run else {"dry_run": False}
+    )
 
     if not outcome.ok:
         error = outcome.message or "the workflow failed"
@@ -217,6 +255,7 @@ async def run_workflow(
         conn.commit()
         return {
             **_identity(run_id, record),
+            **kind,
             "ok": False,
             "status": STATUS_FAILED,
             "code": CODE_WORKFLOW_FAILED,
@@ -239,14 +278,13 @@ async def run_workflow(
         conn.commit()
         return {
             **_identity(run_id, record),
+            **kind,
             "ok": False,
             "status": STATUS_FAILED,
             "code": CODE_INVALID_OUTPUT,
             "error": error,
             "errors": [e.to_json() for e in output_errors],
-            "hint": "The workflow ran, and its side effects happened, but what "
-            "it returned does not match the outputs_schema it declares. Fix one "
-            "or the other and create a new version.",
+            "hint": _output_hint(dry_run),
             "output": outcome.output,
             "steps": steps,
         }
@@ -255,11 +293,45 @@ async def run_workflow(
     conn.commit()
     return {
         **_identity(run_id, record),
+        **kind,
         "ok": True,
         "status": STATUS_COMPLETED,
         "output": outcome.output,
         "steps": steps,
     }
+
+
+# -- the dry run -----------------------------------------------------------
+
+
+def _stand_ins(
+    conn: Connection, simulated: list[dict[str, Any]]
+) -> dict[tuple[str, str], Any]:
+    """One stand-in value per tool a dry run will not call, built up front."""
+    schemas = tool_output_schemas(conn)
+    return {
+        (t["connector"], t["tool"]): stand_in(schemas.get((t["connector"], t["tool"])))
+        for t in simulated
+    }
+
+
+def _without_side_effects(
+    call_tool: CallTool, stand_ins: dict[tuple[str, str], Any]
+) -> CallTool:
+    """``call_tool``, with the listed tools answered instead of called.
+
+    Empty in a real run, so both paths go through the same wrapper and there is
+    only one place where a tool call happens.
+    """
+    if not stand_ins:
+        return call_tool
+
+    async def call(connector: str, tool: str, payload: dict[str, Any]) -> Any:
+        if (connector, tool) in stand_ins:
+            return stand_ins[(connector, tool)]
+        return await call_tool(connector, tool, payload)
+
+    return call
 
 
 # -- helpers ---------------------------------------------------------------
@@ -296,6 +368,21 @@ def _refused(
     }
     result.update(extra)
     return result
+
+
+def _output_hint(dry_run: bool) -> str:
+    """The same defect, but only one of the two readings has already cost you."""
+    if dry_run:
+        return (
+            "The workflow ran to the end and returned the wrong shape. Nothing "
+            "acted -- this is what the dry run is for. Fix the code or the "
+            "outputs_schema and edit the workflow."
+        )
+    return (
+        "The workflow ran, and its side effects happened, but what it returned "
+        "does not match the outputs_schema it declares. Fix one or the other "
+        "and create a new version."
+    )
 
 
 def _connectors_for(

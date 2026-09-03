@@ -53,7 +53,7 @@ def tools_of(server: MCPServer) -> dict[str, Any]:
     return {t.name: t for t in asyncio.run(server.list_tools())}
 
 
-def test_the_server_exposes_the_five_tools(
+def test_the_server_exposes_the_seven_tools(
     home: tuple[RunlacePaths, Connection]
 ) -> None:
     paths, _ = home
@@ -62,9 +62,11 @@ def test_the_server_exposes_the_five_tools(
     assert set(tools) == {
         "get_skill",
         "create_workflow",
+        "edit_workflow",
         "list_workflows",
         "get_workflow",
         "run_workflow",
+        "dry_run_workflow",
     }
     # Descriptions are the interface for a model; none may be empty.
     assert all(t.description for t in tools.values())
@@ -271,3 +273,131 @@ def test_a_workflow_with_no_inputs_compiles_with_the_empty_schema(
         inputs_schema={"type": "object", "properties": {}},
     )
     assert created["ok"] is True
+
+
+def test_a_new_version_is_told_it_has_never_run(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The nudge towards the dry run has to reach the agent that just compiled.
+
+    Nobody calls an optional verification step they were never told about; this
+    is the same reasoning as the confirm gate, one notch softer.
+    """
+    created = call(
+        build_server(home[0]),
+        "create_workflow",
+        name="report",
+        description="d",
+        code=BALANCE,
+        inputs_schema=INPUTS,
+    )
+    assert any("dry_run_workflow" in w for w in created["warnings"])
+
+
+def test_edit_workflow_declares_its_arguments(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, _ = home
+    schema = tools_of(build_server(paths))["edit_workflow"].input_schema
+    assert set(schema["required"]) == {"name", "old_string", "new_string"}
+    assert set(schema["properties"]) == {
+        "name",
+        "old_string",
+        "new_string",
+        "description",
+        "inputs_schema",
+        "outputs_schema",
+    }
+
+
+def test_editing_a_workflow_stores_a_new_version_and_keeps_the_old_one(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The whole point of the tool, seen the way an agent sees it (D1 intact)."""
+    paths, _ = home
+    server = build_server(paths)
+    created = call(
+        server,
+        "create_workflow",
+        name="report",
+        description="A report.",
+        code=BALANCE,
+        inputs_schema=INPUTS,
+    )
+
+    edited = call(
+        server,
+        "edit_workflow",
+        name="report",
+        old_string='return {"to": ctx.inputs["to"]}',
+        new_string='return {"who": ctx.inputs["to"]}',
+    )
+    assert edited["ok"] is True
+    assert edited["version"] != created["version"]
+
+    latest = call(server, "get_workflow", workflow="report")
+    assert '"who"' in latest["code"]
+    # Schemas carried over untouched, and the version we edited is still there.
+    assert latest["inputs_schema"] == INPUTS
+    old = call(server, "get_workflow", workflow="report", version=created["version"])
+    assert old["code"] == BALANCE
+
+
+def test_an_edit_that_matches_nothing_says_how_to_get_the_text_right(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, _ = home
+    server = build_server(paths)
+    call(
+        server,
+        "create_workflow",
+        name="report",
+        description="d",
+        code=BALANCE,
+        inputs_schema=INPUTS,
+    )
+
+    result = call(
+        server, "edit_workflow", name="report", old_string="nope", new_string="x"
+    )
+    assert result["ok"] is False
+    assert result["stage"] == "edit"
+    assert result["errors"][0]["code"] == "no-match"
+    assert "get_workflow" in result["errors"][0]["hint"]
+
+
+def test_dry_run_workflow_declares_its_arguments(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """No `confirm`: there is nothing to confirm when nothing can act."""
+    paths, _ = home
+    schema = tools_of(build_server(paths))["dry_run_workflow"].input_schema
+    assert schema["required"] == ["workflow_id"]
+    assert set(schema["properties"]) == {"workflow_id", "inputs", "version"}
+
+
+def test_a_dry_run_is_not_stopped_by_the_confirm_gate(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """Same workflow that run_workflow refuses, dry-run without confirm.
+
+    The fixture's gmail server does not exist, and that is the point: the tool
+    that would act is stood in for, so the dry run never needs to reach it.
+    """
+    paths, _ = home
+    server = build_server(paths)
+    call(
+        server,
+        "create_workflow",
+        name="notify",
+        description="d",
+        code=SENDS_EMAIL,
+        inputs_schema=INPUTS,
+    )
+
+    result = call(
+        server, "dry_run_workflow", workflow_id="notify", inputs={"to": "a@b.c"}
+    )
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["simulated"] == [{"connector": "gmail", "tool": "send_email"}]

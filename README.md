@@ -7,7 +7,8 @@ See `SPEC.md` for the full design. It is committed verbatim and still uses the
 working name `harness` throughout; everything in this repo has since been
 renamed to Runlace, including the on-disk names D2 and D10 spell out.
 
-**This repo implements M1 through M5 — every milestone in the spec.**
+**This repo implements M1 through M5 — every milestone in the spec — plus M6,
+the authoring loop: `dry_run_workflow` and `edit_workflow`.**
 
 ```
 uv tool install runlace          # or: uvx runlace init
@@ -193,9 +194,10 @@ Two fixes, attacking different halves. The first shipped in M4:
    sample inputs and makes creation slow and network-dependent.
 
 The second is not in `SPEC.md`, and D3 enumerates the compiler as four stages.
-Adding a fifth is a change to a locked decision, so it needs to be either an
-explicit extension of D3 or a separate `dry_run_workflow` tool outside the
-compiler. That call has not been made.
+Adding a fifth would be a change to a locked decision, so it shipped in M6 as a
+separate `dry_run_workflow` tool outside the compiler instead — and without the
+two-tier guarantee, because a side-effecting tool is stood in rather than
+skipped.
 
 ## M4 — the skill and the policy
 
@@ -299,6 +301,46 @@ The wheel carries `SKILL.md` and `py.typed`; `scripts/m5_acceptance.sh` installs
 it into an empty environment with no repo around it and runs `init` and `sync`
 from there, because "it works in the checkout" is not the claim being made.
 
+## M6 — the authoring loop
+
+`SPEC.md` stops at M5. M6 is the loop the spec's five tools leave to the agent's
+patience: write the whole file, run it for real, and hope. Two tools close it,
+and neither touches a locked decision.
+
+### `dry_run_workflow`
+
+Runs the workflow for real and lets nothing act. Every read hits the live
+server and returns the real answer; every tool classified `side_effect` is
+answered from its own declared `outputSchema` instead of being called. Nothing
+is sent, so there is nothing to confirm and there is no gate — every other gate
+still applies, in the same order.
+
+The result is a normal run result plus `{dry_run: true, simulated: [...]}`.
+`simulated` is the honest part: a branch that depends on what one of those calls
+really returns is the one thing a dry run cannot check, so it is named rather
+than glossed over. The run is journaled like any other and marked, so it is
+auditable but never counts as "when this workflow last ran".
+
+This is what turns "it compiles" into "it has actually run". `create_workflow`
+now says so on every new version, in a warning that names the tool — the same
+reasoning as the confirm gate: an optional step nobody is told about is a step
+nobody takes.
+
+### `edit_workflow`
+
+One exact string, replaced once, recompiled, stored as a new version. The
+schemas and the description carry over. It must match exactly and it must match
+once; Runlace will not guess which of two occurrences was meant, because
+guessing wrong changes the wrong line silently.
+
+D1 is untouched: this is `create_workflow` with less typing, not an update. The
+version that was edited stays on disk, readable and runnable.
+
+`scripts/m6_acceptance.sh` walks the whole loop against a live
+`server-everything`: a workflow with a division by zero pyright cannot see, a
+dry run that finds it on real data without toggling anything, a one-string fix,
+a second dry run that passes, then refused-without-confirm and completed-with-it.
+
 ## Development
 
 ```
@@ -311,6 +353,7 @@ uv run pyright                   # Runlace's own source and tests
 ./scripts/m3_acceptance.sh       # the M3 acceptance criterion, end to end
 ./scripts/m4_acceptance.sh       # the M4 acceptance criterion, end to end
 ./scripts/m5_acceptance.sh       # sync, the wheel, and the wheel on its own
+./scripts/m6_acceptance.sh       # create -> dry run -> edit -> refuse -> confirm
 ./scripts/demo.sh                # the two-minute demo
 ./scripts/demo_agent.py          # let a local model write the workflow
 ```
@@ -496,3 +539,39 @@ And these in M5:
   standing, and a small model fixes the line it was shown rather than the one
   that caused it. When the unknowns are all there is, they are the genuine case
   — an unannotated accumulator — and every one is kept.
+
+And these in M6:
+
+- **Two new tools, not a fifth compiler stage.** D3 enumerates the compiler as
+  lint, typecheck, extract, store, and running a workflow is not compiling it.
+  `dry_run_workflow` sits outside the pipeline, so D3 is untouched and a dry run
+  can be repeated as often as you like rather than once at creation.
+- **A dry run stands side effects in; it does not skip them.** Skipping would
+  change the control flow — `if ctx.gmail.send_email(...)` would take the other
+  branch — so every side-effecting call still happens and still returns, just
+  from the tool's own `outputSchema` rather than from the server. A tool that
+  declares no output shape stands in as `None`, which is what D2 already types
+  it as; if the workflow then fails, it assumed a shape nobody promised.
+- **Stand-ins are dull on purpose.** Empty string, `False`, a one-element list,
+  and `1` rather than `0` so a stand-in in a denominator cannot invent a
+  `ZeroDivisionError` the real call would never have caused. Objects are filled
+  with every declared property, not only the required ones: a real server does
+  send its optional keys, and failing on one would be a false alarm.
+- **No confirm gate on a dry run.** D6 gates acting on the world, and a dry run
+  does not act on the world. Every other gate — inputs, drift, the connectors —
+  applies unchanged, except that the servers hosting only stood-in tools are not
+  opened, so a workflow can be checked before the server that would send the
+  email is even reachable.
+- **A dry run is journaled but never counts as the last run.** "When did this
+  last run" is a question about the world. The rows are in `runs` with
+  `dry_run = 1`, readable and auditable; `list_workflows` skips them.
+- **`edit_workflow` refuses an ambiguous match.** Exactly one occurrence, or
+  nothing happens. The alternative is an edit that changes the wrong line and
+  reports success, which is the one failure mode the compiler cannot catch.
+- **An edit inherits the contract it did not mention.** Schemas and description
+  carry over from the version being edited; passing one replaces it. Dropping an
+  `outputs_schema` entirely still needs `create_workflow` — removing a declared
+  contract deserves the whole file in front of you.
+- **Every new version is told it has never run.** Compiling is not evidence that
+  a workflow works, and an optional verification step nobody is told about is a
+  step nobody takes, so the `create_workflow` result names `dry_run_workflow`.

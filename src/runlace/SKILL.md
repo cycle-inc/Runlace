@@ -20,9 +20,21 @@ that code once and get it to compile.
    calls extracted and pinned. On failure you get the stage, the line number, an
    error code and a hint. Fix and send again — that is a normal part of the loop,
    not a failure of the task.
-3. **`run_workflow`** — execute it. If the workflow touches any side-effecting
-   tool, the run is refused until you show the human exactly which tools will act
-   and call again with `confirm=True`.
+3. **`dry_run_workflow`** — run it before you claim it works. Compiling proves
+   the calls have the right shape; only running proves your code survives what
+   the tools actually return. Reads hit the live servers and give you the real
+   answers; anything that would act is answered from its declared output shape
+   instead of being called, so nothing leaves the machine and there is no
+   confirmation to ask for. The result lists what was stood in for under
+   `simulated` — a branch that depends on one of those is the one thing a dry
+   run cannot check for you.
+4. **`edit_workflow`** — fix what the dry run found. Send `name`, `old_string`
+   and `new_string`: one exact string, matching once, copied out of the code
+   `get_workflow` gave you. Sending the whole file back to change one line is
+   where most mistakes come from. You get a new version; the old one stays.
+5. **`run_workflow`** — execute it for real. If the workflow touches any
+   side-effecting tool, the run is refused until you show the human exactly
+   which tools will act and call again with `confirm=True`.
 
 ## The calling convention
 

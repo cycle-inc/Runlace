@@ -7,6 +7,7 @@ everything but workflow code in the database.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -105,6 +106,10 @@ MIGRATIONS = [
     # v2 (M3): why a run failed or was refused. `status` says that it did; this
     # says what to tell the human.
     "ALTER TABLE runs ADD COLUMN error TEXT",
+    # v3: a dry run is journaled like any other run -- it really executed, and
+    # its read-only steps really happened -- but it must never be mistaken for
+    # one, because its side effects were stood in for and never left the machine.
+    "ALTER TABLE runs ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0",
 ]
 
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
@@ -321,13 +326,16 @@ def list_workflow_summaries(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                      WHERE workflow_id = w.id)          AS created_at,
                    (SELECT COUNT(*) FROM workflow_versions
                      WHERE workflow_id = w.id)          AS version_count,
+                   -- Dry runs are excluded on purpose: "when did this last run"
+                   -- is a question about the world, and a dry run never touched
+                   -- it. They are still in `runs`, still readable.
                    (SELECT r.status FROM runs r
                       JOIN workflow_versions rv ON rv.id = r.workflow_version_id
-                     WHERE rv.workflow_id = w.id
+                     WHERE rv.workflow_id = w.id AND r.dry_run = 0
                      ORDER BY r.started_at DESC, r.rowid DESC LIMIT 1) AS last_run_status,
                    (SELECT r.started_at FROM runs r
                       JOIN workflow_versions rv ON rv.id = r.workflow_version_id
-                     WHERE rv.workflow_id = w.id
+                     WHERE rv.workflow_id = w.id AND r.dry_run = 0
                      ORDER BY r.started_at DESC, r.rowid DESC LIMIT 1) AS last_run_at
             FROM workflows w
             LEFT JOIN workflow_versions v ON v.id = w.latest_version
@@ -364,15 +372,23 @@ def insert_run(
     workflow_version_id: str,
     inputs: Any,
     confirmed: bool,
+    dry_run: bool = False,
 ) -> None:
     """Open a run. Written before anything is attempted, so a crash leaves a trace."""
     conn.execute(
         """
         INSERT INTO runs(id, workflow_version_id, inputs_json, confirmed, status,
-                         started_at)
-        VALUES(?, ?, ?, ?, 'running', ?)
+                         started_at, dry_run)
+        VALUES(?, ?, ?, ?, 'running', ?, ?)
         """,
-        (run_id, workflow_version_id, canonical_json(inputs), int(confirmed), now_iso()),
+        (
+            run_id,
+            workflow_version_id,
+            canonical_json(inputs),
+            int(confirmed),
+            now_iso(),
+            int(dry_run),
+        ),
     )
 
 
@@ -452,6 +468,25 @@ def tool_schema_hashes(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
         (str(row["connector"]), str(row["name"])): str(row["schema_hash"])
         for row in conn.execute("SELECT connector, name, schema_hash FROM tools")
     }
+
+
+def tool_output_schemas(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, str], dict[str, Any] | None]:
+    """Current ``(connector, tool) -> outputSchema``, for standing a tool in.
+
+    ``None`` means the server declares no output shape (D2 types those as
+    ``Any``), which is a different thing from a tool that is not here at all --
+    absent keys are absent.
+    """
+    schemas: dict[tuple[str, str], dict[str, Any] | None] = {}
+    for row in conn.execute("SELECT connector, name, output_schema_json FROM tools"):
+        raw = row["output_schema_json"]
+        parsed = json.loads(raw) if isinstance(raw, str) else None
+        schemas[(str(row["connector"]), str(row["name"]))] = (
+            parsed if isinstance(parsed, dict) else None
+        )
+    return schemas
 
 
 def method_index(conn: sqlite3.Connection) -> dict[str, list[str]]:

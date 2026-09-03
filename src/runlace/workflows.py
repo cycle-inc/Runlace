@@ -37,6 +37,17 @@ NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 VERSION_LENGTH = 16
 
 STAGE_VALIDATE = "validate"
+STAGE_EDIT = "edit"
+
+# Compiling is not evidence that a workflow works: pyright can only say the
+# calls have the right shape, never that the tool returns what the next line
+# assumed. This rides on every new version for the same reason the confirm gate
+# exists -- an optional step nobody is told about is a step nobody takes.
+NEVER_RUN_WARNING = (
+    "This version has never run. Call dry_run_workflow before telling the human "
+    "it works: it executes for real against the live servers and stands in only "
+    "for the tools that would act."
+)
 
 
 @dataclass
@@ -102,6 +113,104 @@ def create_workflow(
         inputs_schema=inputs_schema,
         outputs_schema=outputs_schema,
         compiled=compiled,
+    )
+
+
+def edit_workflow(
+    conn: Connection,
+    paths: RunlacePaths,
+    *,
+    name: str,
+    old_string: str,
+    new_string: str,
+    description: str | None = None,
+    inputs_schema: dict[str, Any] | None = None,
+    outputs_schema: dict[str, Any] | None = None,
+) -> CreateResult:
+    """Replace one exact string in a workflow's latest code, and recompile it.
+
+    This stores a new version exactly as :func:`create_workflow` does -- it is
+    not an update, and D1's immutability is untouched. What it saves is the
+    round trip: changing one line otherwise means reading the whole file back
+    and sending the whole file again, which is most of what an agent's tokens go
+    on and, for a small model, most of what it gets wrong.
+
+    Schemas are inherited from the version being edited. Passing one replaces
+    it; passing ``None`` keeps it. Removing an ``outputs_schema`` altogether is
+    the one change that needs :func:`create_workflow`, because dropping a
+    declared contract deserves the whole file in front of you.
+    """
+    record = get_workflow(conn, name)
+    if record is None or record.get("version") is None:
+        return _edit_failed(
+            f"no workflow called `{name}`" if record is None
+            else f"workflow `{name}` has no versions to edit",
+            "Call list_workflows to see what exists. To write a new workflow, "
+            "use create_workflow.",
+            "unknown-workflow",
+        )
+
+    code = record.get("code")
+    if not isinstance(code, str):
+        return _edit_failed(
+            f"the code for version {record['version']} is missing from disk",
+            f"Expected it at {record.get('file_path')}. Use create_workflow to "
+            f"store the workflow again.",
+            "missing-code",
+        )
+
+    edited = _replace(code, old_string, new_string)
+    if isinstance(edited, CreateResult):
+        return edited
+
+    return create_workflow(
+        conn,
+        paths,
+        name=name,
+        description=description if description is not None else record.get("description"),
+        code=edited,
+        inputs_schema=(
+            inputs_schema if inputs_schema is not None else record.get("inputs_schema")
+        ),
+        outputs_schema=(
+            outputs_schema if outputs_schema is not None else record.get("outputs_schema")
+        ),
+    )
+
+
+def _replace(code: str, old_string: str, new_string: str) -> str | CreateResult:
+    """The edited code, or the refusal to guess which occurrence was meant."""
+    if old_string == new_string:
+        return _edit_failed(
+            "old_string and new_string are identical",
+            "Nothing would change. Send the text you want instead in new_string.",
+            "no-change",
+        )
+    occurrences = code.count(old_string)
+    if occurrences == 0:
+        return _edit_failed(
+            "old_string does not appear in the workflow's code",
+            "It has to match the file exactly, including indentation and blank "
+            "lines. Call get_workflow to read the current code and copy the "
+            "text out of it.",
+            "no-match",
+        )
+    if occurrences > 1:
+        return _edit_failed(
+            f"old_string appears {occurrences} times; it has to be unique",
+            "Include the surrounding lines until the text appears only once. "
+            "Guessing which one you meant is how an edit silently changes the "
+            "wrong line.",
+            "not-unique",
+        )
+    return code.replace(old_string, new_string)
+
+
+def _edit_failed(message: str, hint: str, code: str) -> CreateResult:
+    return CreateResult(
+        ok=False,
+        stage=STAGE_EDIT,
+        errors=[CompileError(STAGE_EDIT, None, message, hint, code)],
     )
 
 
@@ -206,7 +315,7 @@ def _store(
         version=version,
         version_id=version_id,
         tools_used=tools_used,
-        warnings=list(compiled.warnings),
+        warnings=[*compiled.warnings, NEVER_RUN_WARNING],
         created=True,
     )
 
