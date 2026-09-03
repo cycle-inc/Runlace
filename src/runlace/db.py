@@ -454,6 +454,26 @@ def tool_schema_hashes(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
     }
 
 
+def method_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """``ctx.<attr>`` -> the method names spelled on it, for lint's error hints.
+
+    Connectors with no tools are still keys: `ctx.<attr>` naming a real but empty
+    connector is a different mistake from `ctx.<attr>` naming nothing at all.
+    """
+    index: dict[str, list[str]] = {
+        str(row["attr"]): [] for row in conn.execute("SELECT attr FROM connectors")
+    }
+    for row in conn.execute(
+        """
+        SELECT c.attr AS attr, t.method AS method
+        FROM tools t JOIN connectors c ON c.name = t.connector
+        ORDER BY c.attr, t.method
+        """
+    ):
+        index.setdefault(str(row["attr"]), []).append(str(row["method"]))
+    return index
+
+
 def prune_connectors(conn: sqlite3.Connection, keep: list[str]) -> None:
     """Drop connectors that are no longer in the config."""
     if keep:

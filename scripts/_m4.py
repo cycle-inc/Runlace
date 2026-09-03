@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
-from mcp.types import CallToolResult, TextContent
+from _mcp import call as call  # re-exported: the steps import everything from here
 
 # Written against nothing but what `get_skill` returned: the connector index
 # gives `ctx.everything.echo` and `ctx.everything.get_sum`, and the stub gives
@@ -33,15 +30,3 @@ INPUTS: dict[str, Any] = {
 }
 
 ARGUMENTS: dict[str, Any] = {"message": "good morning", "a": 20, "b": 22}
-
-
-def call(server: MCPServer, tool: str, /, **arguments: Any) -> dict[str, Any]:
-    """One MCP tool call, the way a client makes it."""
-    result = asyncio.run(server.call_tool(tool, arguments))
-    assert isinstance(result, CallToolResult), result
-    assert not result.is_error, result.content
-    if result.structured_content is not None:
-        return dict(result.structured_content)
-    block = result.content[0]
-    assert isinstance(block, TextContent), block
-    return dict(json.loads(block.text))

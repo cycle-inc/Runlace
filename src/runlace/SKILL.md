@@ -152,11 +152,14 @@ Each is rejected at lint with the error code shown, a line number and a hint.
 | `async-not-supported` | `async def`, `await` |
 | `missing-run` | no top-level `def run` |
 | `bad-run-signature` | `run` takes something other than a single `ctx` |
+| `run-decorated` | a decorator on `run` — there is no framework to register with |
 | `ctx-rebound` | assigning to `ctx` |
 | `ctx-escape` | putting `ctx` or a connector in a variable, list or call argument |
 | `ctx-tool-not-called` | referencing a tool without calling it |
+| `unknown-connector` | `ctx.<tool>(...)` — the tool's name where the server's belongs |
 | `missing-return-annotation` | `def run(ctx):` with no `->` |
-| `bad-output-annotation` | `-> Output` with no `outputs_schema`, or an `outputs_schema` with a different annotation |
+| `bad-ctx-annotation` | `ctx` not annotated `Ctx`, or `Ctx` not imported from `runlace_types` |
+| `bad-output-annotation` | an `outputs_schema` without `-> Output`, or an `Output` you defined or never imported |
 | `syntax-error` | the code does not parse |
 
 There is no escape hatch. A workflow that needs the network gets there through

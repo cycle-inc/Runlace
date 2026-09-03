@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .db import Connection
+from .db import Connection, method_index
 from .extract import ToolCall, extract_tool_calls
 from .lint import lint
 from .naming import python_identifier
@@ -103,7 +103,11 @@ def compile_workflow(
     outputs_schema: dict[str, Any] | None = None,
 ) -> CompileResult:
     """Run the D3 pipeline. Never raises for bad input; it returns a verdict."""
-    lint_errors = lint(code, outputs_declared=outputs_schema is not None)
+    lint_errors = lint(
+        code,
+        outputs_declared=outputs_schema is not None,
+        connectors=method_index(conn),
+    )
     if lint_errors:
         return CompileResult(
             ok=False,
@@ -194,25 +198,31 @@ def _typecheck(
 
 
 # Strict mode reports these alongside the error that caused them: an unknown
-# attribute is also an unknown type. Reporting both makes the agent read two
-# messages to learn one thing.
+# attribute is also an unknown type, and so is every variable downstream of it.
+# Reporting both makes the agent read six messages to learn one thing.
 _CASCADE_RULES = frozenset(
     {
         "reportUnknownMemberType",
         "reportUnknownVariableType",
         "reportUnknownArgumentType",
         "reportUnknownParameterType",
+        "reportUnknownLambdaType",
     }
 )
 
 
 def _without_cascades(diagnostics: list[Diagnostic]) -> list[Diagnostic]:
-    """Drop "type is unknown" noise from lines that already have a real error."""
-    explained = {d.line for d in diagnostics if d.rule not in _CASCADE_RULES}
-    kept = [
-        d for d in diagnostics if d.rule not in _CASCADE_RULES or d.line not in explained
-    ]
-    return kept or diagnostics
+    """Drop "type is unknown" noise whenever a real error explains it.
+
+    File-wide, not line by line: a misspelled connector on line 9 makes the
+    variable on line 10 and the return on line 13 unknown too, and an 8B model
+    fixing the reported line one at a time never gets to the cause. When the
+    unknowns are all there is, they are the genuine case -- an accumulator with
+    no annotation -- and every one of them is kept.
+    """
+    if all(d.rule in _CASCADE_RULES for d in diagnostics):
+        return diagnostics
+    return [d for d in diagnostics if d.rule not in _CASCADE_RULES]
 
 
 _TYPECHECK_HINTS = {

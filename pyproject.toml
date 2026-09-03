@@ -2,7 +2,21 @@
 name = "runlace"
 version = "0.1.0"
 description = "Deterministic, replayable workflows over your MCP servers."
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["mcp", "model-context-protocol", "agents", "workflows", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+    "Typing :: Typed",
+]
 dependencies = [
     "httpx2>=2.5",
     "mcp>=2.1",
@@ -15,6 +29,11 @@ dependencies = [
     "types-pyyaml>=6.0.12.20260815",
     "typing-extensions>=4.12",
 ]
+
+[project.urls]
+Homepage = "https://github.com/cycle-inc/Runlace"
+Repository = "https://github.com/cycle-inc/Runlace"
+Issues = "https://github.com/cycle-inc/Runlace/issues"
 
 [project.scripts]
 runlace = "runlace.cli:main"

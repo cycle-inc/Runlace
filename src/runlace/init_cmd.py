@@ -141,6 +141,23 @@ def run_init(
     connectors: list[Connector] = imported.connectors
     write_config(paths.config, connectors)
 
+    discover_and_persist(paths, connectors, report, timeout=timeout)
+    return report
+
+
+def discover_and_persist(
+    paths: RunlacePaths,
+    connectors: list[Connector],
+    report: InitReport,
+    *,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> list[DiscoveryResult]:
+    """Connect, write down what came back, regenerate the stubs.
+
+    Shared by `init` and `sync`. The difference between them is upstream --
+    where the connector list came from -- and downstream: `sync` compares what
+    it got against what was already there.
+    """
     policy = read_policy(paths.policy)
     report.warnings.extend(policy.warnings)
 
@@ -181,7 +198,7 @@ def run_init(
     generated = stubs.generate(paths, specs)
     report.stub_files = generated.files
     report.warnings.extend(generated.warnings)
-    return report
+    return results
 
 
 def format_table(rows: list[ConnectorRow]) -> str:

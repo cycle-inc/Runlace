@@ -7,7 +7,16 @@ See `SPEC.md` for the full design. It is committed verbatim and still uses the
 working name `harness` throughout; everything in this repo has since been
 renamed to Runlace, including the on-disk names D2 and D10 spell out.
 
-**This repo currently implements M1, M2, M3 and M4.**
+**This repo implements M1 through M5 — every milestone in the spec.**
+
+```
+uv tool install runlace          # or: uvx runlace init
+runlace init                     # imports the MCP configs you already have
+runlace serve                    # add this to Claude Code, Cursor, anything
+```
+
+To watch the whole loop in two minutes, against a real MCP server and with no
+API key: `./scripts/demo.sh`.
 
 ## M1 — skeleton & discovery
 
@@ -224,8 +233,71 @@ believe a tool is gated and it is not.
 
 ### Not in M4
 
-`runlace sync` as a command; the dry run described above. Resume, scheduling and
-streaming progress are v2.
+`runlace sync` as a command is M5; the dry run described above is unbuilt.
+Resume, scheduling and streaming progress are v2.
+
+## M5 — launch
+
+### `runlace sync`
+
+An MCP server is somebody else's software. Parameters get renamed, tools get
+retired, whole servers stop answering, and D1's pinning means none of that can
+silently change what a stored workflow does — it just stops running. `sync`
+re-discovers every configured connector and reports the difference.
+
+```
+runlace sync
+```
+
+The tool diff is the easy half:
+
+```
+0 tool(s) added, 2 removed, 1 changed their schema
+  - pennylane.get_balance
+  ~ github.create_issue
+```
+
+The half that decides whether anyone has work to do is the second one:
+
+```
+1 of 4 workflow(s) would now be refused:
+  weekly-report (a1a204ba0580)
+      pennylane.get_balance no longer exists
+```
+
+It exits 1 when something is broken, so it belongs in cron. It regenerates the
+stubs on the way through — the next workflow an agent writes is checked against
+what the servers do now, not what they did at `init`. A connector that failed to
+answer is called out separately, because "every tool of one server vanished"
+almost always means the server is down, and recreating workflows on that
+evidence would be the wrong move.
+
+Nothing is ever rewritten. The pinned versions stay on disk and stay readable
+with `get_workflow`; recreating one is a decision, and decisions are the agent's.
+
+### Small models
+
+Runlace's whole premise is that the model writes the workflow once, so the
+question is whether a cheap local model can do the writing. `scripts/demo_agent.py`
+runs that loop against any OpenAI-compatible endpoint, Ollama by default:
+
+```
+ollama serve & ollama pull qwen3:8b
+./scripts/demo_agent.py --task "Echo a greeting and add two numbers"
+```
+
+What we measured, and where the floor is, is in `docs/SMALL_MODELS.md`.
+
+### Packaging
+
+```
+uv build
+uv publish --dry-run --trusted-publishing never --token dry-run
+```
+
+The wheel carries `SKILL.md` and `py.typed`; `scripts/m5_acceptance.sh` installs
+it into an empty environment with no repo around it and runs `init` and `sync`
+from there, because "it works in the checkout" is not the claim being made.
 
 ## Development
 
@@ -238,6 +310,9 @@ uv run pyright                   # Runlace's own source and tests
 ./scripts/m2_acceptance.sh       # the M2 acceptance criteria, end to end
 ./scripts/m3_acceptance.sh       # the M3 acceptance criterion, end to end
 ./scripts/m4_acceptance.sh       # the M4 acceptance criterion, end to end
+./scripts/m5_acceptance.sh       # sync, the wheel, and the wheel on its own
+./scripts/demo.sh                # the two-minute demo
+./scripts/demo_agent.py          # let a local model write the workflow
 ```
 
 Tests set `RUNLACE_HOME` to a temporary directory, so they never touch your
@@ -373,3 +448,51 @@ And these in M4:
   "fix one or the other" would send an agent rewriting a schema that was never
   the problem, so that case gets its own hint — build the list inside the
   `return`, where the declared type gives each item its expected shape.
+
+And these in M5:
+
+- **`sync` writes; it is not a dry report.** It persists what it discovered and
+  regenerates the stubs, exactly as `init` does, then reports the difference
+  against what was there before. The alternative — report now, apply later —
+  would leave the stubs describing servers that have moved on, so the next
+  workflow an agent writes would be checked against yesterday. The stored
+  workflow versions are the thing that never changes, and they do not.
+- **`sync` exits 1 when a workflow is broken**, and 0 otherwise, so it can be a
+  cron job rather than something someone remembers to read.
+- **Only the latest version of each workflow is checked for drift.** Older
+  versions are history; D1 keeps them readable whatever the servers do, and
+  reporting that a superseded version no longer runs is noise.
+- **An unreachable connector is reported apart from the tool diff.** Its tools
+  do read as removed — that is what the database now says — but every tool of
+  one server disappearing at once is far more often an outage than a retirement.
+- **MIT, and `SPEC.md` does not say.** The spec asks for a PyPI publish dry run
+  and names no licence, and PyPI needs one. MIT is the convention for a tool
+  like this; the copyright line says "Runlace contributors" rather than guessing
+  a legal entity. Both are one edit away if that is wrong.
+- **`py.typed` ships.** The package is fully annotated and the classifiers claim
+  it, so importers should get the annotations rather than `Any`.
+- **Lint now checks the `Ctx` annotation and the imports behind it.** Watching a
+  local 8B model work through the loop turned up a cascade: one missing
+  `from runlace_types import Ctx` came back as nine pyright errors, every one of
+  them a variant of "type of X is unknown" and none of them naming the line to
+  add. That is one mistake, so it is now one lint error that says what to write.
+  The same goes for `-> Output` without the import, which lint previously only
+  looked at when an `outputs_schema` was declared.
+- **Lint's hints know your connectors.** `ctx.echo(...)` is what a model writes
+  after reading an index that lists tools, and the honest generic hint — "write
+  `ctx.echo.<tool>(...)`" — is the same mistake one level deeper, stated with
+  confidence. `compile_workflow` passes the connector index in, so the error
+  becomes "`echo` is a tool, not a connector — write `ctx.everything.echo(...)`".
+  It changes no verdict; a wrong connector was already rejected a stage later.
+  Where the tool name is ambiguous across servers, no server is suggested.
+- **A decorator on `run` is a lint error.** Models that have met other agent
+  libraries write `@workflow`. pyright answered with `"workflow" is not defined`
+  and `untyped function decorator obscures type of function`, and neither says
+  the line should not be there. Runlace is not a framework you register with, so
+  `run-decorated` says so.
+- **The "unknown type" cascade is dropped file-wide, not line by line.** A
+  misspelled connector on line 9 makes the variables on lines 10 and 13 unknown
+  too. Filtering only the line that already carried a real error left those
+  standing, and a small model fixes the line it was shown rather than the one
+  that caused it. When the unknowns are all there is, they are the genuine case
+  — an unannotated accumulator — and every one is kept.

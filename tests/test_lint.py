@@ -12,6 +12,7 @@ import pytest
 from runlace import lint as lint_module
 from runlace.lint import (
     E_ASYNC,
+    E_CTX_ANNOTATION,
     E_CTX_ESCAPE,
     E_CTX_REBOUND,
     E_CTX_TOOL_NOT_CALLED,
@@ -24,9 +25,11 @@ from runlace.lint import (
     E_OUTPUT_ANNOTATION,
     E_RELATIVE_IMPORT,
     E_RETURN_ANNOTATION,
+    E_RUN_DECORATED,
     E_RUN_SIGNATURE,
     E_STUB_SUBMODULE,
     E_SYNTAX,
+    E_UNKNOWN_CONNECTOR,
     lint,
 )
 
@@ -253,6 +256,73 @@ def test_the_output_type_has_to_be_imported() -> None:
     assert "never imported" in errors[0].message
 
 
+# -- ctx, and the connector index -------------------------------------------
+
+
+def test_the_ctx_parameter_has_to_be_annotated() -> None:
+    """One missing annotation is nine unreadable pyright errors, or one of these."""
+    code = (
+        "from runlace_types import Ctx\n\n\n"
+        "def run(ctx) -> dict[str, object]:\n    return {}\n"
+    )
+    errors = lint(code)
+    assert [e.code for e in errors] == [E_CTX_ANNOTATION]
+    assert "no type annotation" in errors[0].message
+
+
+def test_the_ctx_type_has_to_be_imported() -> None:
+    errors = lint("def run(ctx: Ctx) -> dict[str, object]:\n    return {}\n")
+    assert [e.code for e in errors] == [E_CTX_ANNOTATION]
+    assert "never imported" in errors[0].message
+
+
+def test_a_workflow_cannot_bring_its_own_ctx_type() -> None:
+    code = (
+        "from typing import Any\n\n\n"
+        "class Ctx:\n    everything: Any\n\n\n"
+        "def run(ctx: Ctx) -> dict[str, object]:\n    return {}\n"
+    )
+    errors = lint(code)
+    assert [e.code for e in errors] == [E_CTX_ANNOTATION]
+    assert errors[0].line == 4  # the class, which is what has to go
+
+
+def test_annotating_ctx_with_something_else_is_rejected() -> None:
+    code = "from runlace_types import Ctx\n\n\ndef run(ctx: object) -> dict[str, object]:\n    return {}\n"
+    errors = lint(code)
+    assert [e.code for e in errors] == [E_CTX_ANNOTATION]
+    assert "must be annotated `Ctx`" in errors[0].message
+
+
+CONNECTORS = {"everything": ["echo", "get_sum"], "gmail": ["send_email"]}
+
+
+def test_a_tool_used_where_a_connector_belongs_is_named_as_such() -> None:
+    """The mistake a model makes after reading a flat index of tools.
+
+    The generic hint tells it to write `ctx.echo.<tool>(...)`, which is the same
+    mistake with an extra level on it.
+    """
+    errors = lint(workflow('ctx.echo(message="hi")'), connectors=CONNECTORS)
+    assert [e.code for e in errors] == [E_UNKNOWN_CONNECTOR]
+    assert "`echo` is a tool, not a connector" in errors[0].message
+    assert "ctx.everything.echo(...)" in errors[0].hint
+
+
+def test_an_ambiguous_tool_name_gets_no_suggestion() -> None:
+    """Guessing which server was meant would be the same error, better dressed."""
+    both = {"a": ["send"], "b": ["send"]}
+    errors = lint(workflow("ctx.send()"), connectors=both)
+    assert [e.code for e in errors] == [E_CTX_TOOL_NOT_CALLED]
+    assert "Connected on this machine: a, b." in errors[0].hint
+
+
+def test_without_a_connector_index_the_hint_is_the_generic_one() -> None:
+    errors = lint(workflow('ctx.echo(message="hi")'))
+    assert [e.code for e in errors] == [E_CTX_TOOL_NOT_CALLED]
+    assert "Connected on this machine" not in errors[0].hint
+
+
 # -- shape of the errors ---------------------------------------------------
 
 
@@ -277,3 +347,55 @@ def test_forbidden_patterns_produce_distinct_errors() -> None:
 
     call_messages = {lint(workflow(line))[0].message for _, line, _ in FORBIDDEN_CALLS}
     assert len(call_messages) == len(FORBIDDEN_CALLS)
+
+
+def test_output_must_be_imported_even_without_an_outputs_schema() -> None:
+    """`-> Output` is legal there; an `Output` that came from nowhere is not."""
+    code = "from runlace_types import Ctx\n\n\ndef run(ctx: Ctx) -> Output:\n    return {}\n"
+    errors = lint(code)
+    assert [e.code for e in errors] == [E_OUTPUT_ANNOTATION]
+    assert "never imported" in errors[0].message
+
+
+def test_importing_output_without_an_outputs_schema_is_fine() -> None:
+    code = (
+        "from runlace_types import Ctx, Output\n\n\n"
+        "def run(ctx: Ctx) -> Output:\n    return {}\n"
+    )
+    assert lint(code) == []
+
+
+# -- decorators --------------------------------------------------------------
+
+
+def test_a_decorator_on_run_is_rejected() -> None:
+    """`@workflow` is the habit a model brings from every other agent library."""
+    code = (
+        "from runlace_types import Ctx\n\n\n"
+        "@workflow\n"
+        "def run(ctx: Ctx) -> dict[str, object]:\n    return {}\n"
+    )
+    errors = lint(code)
+    assert [e.code for e in errors] == [E_RUN_DECORATED]
+    assert errors[0].line == 4
+    assert "not a framework" in errors[0].hint
+
+
+def test_every_decorator_on_run_is_named() -> None:
+    """Reporting one of two leaves the second as a pyright error next round."""
+    code = (
+        "from runlace_types import Ctx\n\n\n"
+        "@workflow\n@traced\n"
+        "def run(ctx: Ctx) -> dict[str, object]:\n    return {}\n"
+    )
+    assert [e.line for e in lint(code)] == [4, 5]
+
+
+def test_a_decorator_elsewhere_is_none_of_our_business() -> None:
+    """Only `run` is the entry point; a helper may decorate itself freely."""
+    code = (
+        "from runlace_types import Ctx\nimport dataclasses\n\n\n"
+        "@dataclasses.dataclass\nclass Row:\n    n: int\n\n\n"
+        "def run(ctx: Ctx) -> dict[str, object]:\n    return {}\n"
+    )
+    assert lint(code) == []

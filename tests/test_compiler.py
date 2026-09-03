@@ -7,9 +7,16 @@ has to fail at typecheck, with a line number.
 
 from __future__ import annotations
 
-from runlace.compiler import STAGE_EXTRACT, STAGE_LINT, STAGE_TYPECHECK, compile_workflow
+from runlace.compiler import (
+    STAGE_EXTRACT,
+    STAGE_LINT,
+    STAGE_TYPECHECK,
+    _without_cascades,
+    compile_workflow,
+)
 from runlace.db import Connection
 from runlace.paths import RunlacePaths
+from runlace.typecheck import Diagnostic
 
 INPUTS = {
     "type": "object",
@@ -439,3 +446,59 @@ def test_compilation_leaves_nothing_behind(
     )
     assert sorted(p.name for p in paths.home.iterdir()) == before
     assert list(paths.workflows.iterdir()) == []
+
+
+def test_the_lint_hint_knows_which_connector_a_tool_lives_on(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """`ctx.get_balance()` is what a model writes after reading a list of tools.
+
+    Lint alone can only say "write `ctx.get_balance.<tool>(...)`", which is the
+    same mistake one level deeper. Compiled against a real home it has the
+    connector index, so it can name the server instead.
+    """
+    paths, conn = home
+    code = (
+        "from runlace_types import Ctx\n\n\n"
+        "def run(ctx: Ctx) -> dict[str, object]:\n"
+        "    ctx.get_balance()\n"
+        '    return {"ok": True}\n'
+    )
+    result = compile_workflow(
+        conn, paths.types, name="probe", code=code, inputs_schema=None
+    )
+    assert result.stage == STAGE_LINT
+    assert result.errors[0].code == "unknown-connector"
+    assert "ctx.pennylane.get_balance(...)" in result.errors[0].hint
+
+
+# -- the cascade filter ------------------------------------------------------
+
+
+def diagnostic(line: int, message: str, rule: str) -> Diagnostic:
+    return Diagnostic(file="w.py", line=line, message=message, rule=rule)
+
+
+def test_unknown_type_noise_is_dropped_from_every_line_not_just_the_broken_one() -> None:
+    """A misspelled connector on line 9 makes lines 10 and 13 unknown too.
+
+    Filtering line by line left those two in, and an 8B model that fixes the
+    line it was shown never reaches the cause.
+    """
+    kept = _without_cascades(
+        [
+            diagnostic(9, 'Cannot access attribute "everthing"', "reportAttributeAccessIssue"),
+            diagnostic(10, 'Type of "temperature" is unknown', "reportUnknownVariableType"),
+            diagnostic(13, 'Type of "alerted" is unknown', "reportUnknownVariableType"),
+        ]
+    )
+    assert [d.line for d in kept] == [9]
+
+
+def test_unknown_types_survive_when_they_are_the_whole_complaint() -> None:
+    """No real error to explain them means this is the accumulator case."""
+    diagnostics = [
+        diagnostic(4, 'Type of "rows" is unknown', "reportUnknownVariableType"),
+        diagnostic(6, 'Type of "append" is unknown', "reportUnknownMemberType"),
+    ]
+    assert _without_cascades(diagnostics) == diagnostics

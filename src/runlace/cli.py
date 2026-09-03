@@ -1,7 +1,7 @@
 """The ``runlace`` command line.
 
-M1 shipped ``init``; M2 adds ``serve``. ``sync`` arrives with a later milestone
-and is not stubbed out here.
+Three commands: ``init`` sets a home up, ``serve`` exposes it to an MCP host,
+``sync`` re-discovers and reports what that cost you.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from .config import default_config_sources
 from .init_cmd import format_table, run_init
 from .paths import paths as runlace_paths
 from .server import serve as serve_server
+from .sync_cmd import format_broken, format_changes, run_sync
 from .typecheck import check_stubs
 
 app = typer.Typer(
@@ -76,6 +77,67 @@ def init(
         typer.echo(result.report())
         if not result.ok:
             raise typer.Exit(code=1)
+
+
+@app.command()
+def sync(
+    timeout: Annotated[
+        float, typer.Option(help="Seconds to wait for each server to answer tools/list.")
+    ] = 30.0,
+) -> None:
+    """Re-discover your MCP servers and report which stored workflows broke."""
+    paths = runlace_paths()
+    if not paths.config.exists():
+        typer.secho(
+            f"No Runlace home at {paths.home}. Run `runlace init` first.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Runlace home: {paths.home}")
+    report = run_sync(paths, timeout=timeout)
+
+    typer.echo("")
+    typer.echo(format_table(report.rows) if report.rows else "No MCP servers found.")
+
+    counts = report.counts()
+    typer.echo("")
+    typer.echo(
+        f"{counts['added']} tool(s) added, {counts['removed']} removed, "
+        f"{counts['changed']} changed their schema"
+    )
+    if report.changes:
+        typer.echo(format_changes(report.changes))
+
+    for warning in report.warnings:
+        typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW)
+    for name in report.unreachable:
+        typer.secho(
+            f"warning: {name} did not answer, so its tools now read as removed. "
+            f"Fix the server and sync again before recreating anything.",
+            fg=typer.colors.YELLOW,
+        )
+
+    typer.echo("")
+    if report.ok:
+        typer.secho(
+            f"{report.workflows_checked} workflow(s) checked, all still runnable.",
+            fg=typer.colors.GREEN,
+        )
+        return
+
+    typer.secho(
+        f"{len(report.broken)} of {report.workflows_checked} workflow(s) would now "
+        f"be refused:",
+        fg=typer.colors.RED,
+    )
+    typer.echo(format_broken(report.broken))
+    typer.echo("")
+    typer.echo(
+        "Their pinned versions are untouched and still readable with "
+        "`get_workflow`. Review what changed, then create a new version of each."
+    )
+    raise typer.Exit(code=1)
 
 
 @app.command()

@@ -11,6 +11,7 @@ saying what to do instead, because the reader is an LLM that has to fix it.
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -85,8 +86,12 @@ E_CTX_ESCAPE = "ctx-escape"
 E_CTX_TOOL_NOT_CALLED = "ctx-tool-not-called"
 E_RETURN_ANNOTATION = "missing-return-annotation"
 E_OUTPUT_ANNOTATION = "bad-output-annotation"
+E_CTX_ANNOTATION = "bad-ctx-annotation"
+E_UNKNOWN_CONNECTOR = "unknown-connector"
+E_RUN_DECORATED = "run-decorated"
 
 OUTPUT_TYPE = "Output"
+CTX_TYPE = "Ctx"
 
 
 @dataclass(frozen=True)
@@ -105,12 +110,23 @@ class LintError:
         }
 
 
-def lint(code: str, *, outputs_declared: bool = False) -> list[LintError]:
+def lint(
+    code: str,
+    *,
+    outputs_declared: bool = False,
+    connectors: Mapping[str, Sequence[str]] | None = None,
+) -> list[LintError]:
     """Check a workflow file. An empty list means it passed.
 
     ``outputs_declared`` says whether the workflow came with an
     ``outputs_schema``; if it did, D7 requires ``run`` to be annotated
     ``-> Output`` so pyright can check the return value against it.
+
+    ``connectors`` maps ``ctx.<attr>`` to the tool methods spelled on it, as
+    :func:`runlace.db.method_index` returns it. It changes no verdict -- pyright
+    would reject an unknown connector a stage later regardless -- and only
+    sharpens the message: "`echo` is a tool on `everything`" is a fix, where
+    "write `ctx.echo.<tool>(...)`" is a wrong turn confidently signposted.
     """
     try:
         tree = ast.parse(code)
@@ -124,7 +140,7 @@ def lint(code: str, *, outputs_declared: bool = False) -> list[LintError]:
             )
         ]
 
-    checker = _Checker(tree, outputs_declared=outputs_declared)
+    checker = _Checker(tree, outputs_declared=outputs_declared, connectors=connectors)
     checker.run()
     return sorted(checker.errors, key=lambda e: (e.line, e.code))
 
@@ -138,21 +154,30 @@ def _is_dynamic_access_call(node: ast.AST | None) -> bool:
 
 
 class _Checker:
-    def __init__(self, tree: ast.Module, *, outputs_declared: bool) -> None:
+    def __init__(
+        self,
+        tree: ast.Module,
+        *,
+        outputs_declared: bool,
+        connectors: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
         self.tree = tree
         self.outputs_declared = outputs_declared
+        self.connectors = connectors
         self.errors: list[LintError] = []
-        self._imports_output = any(
-            isinstance(node, ast.ImportFrom)
-            and node.module == STUB_PACKAGE
-            and not node.level
-            and any(a.name == OUTPUT_TYPE and a.asname is None for a in node.names)
-            for node in tree.body
-        )
         self.parents: dict[ast.AST, ast.AST] = {}
         for node in ast.walk(tree):
             for child in ast.iter_child_nodes(node):
                 self.parents[child] = node
+
+    def _imports_from_stubs(self, name: str) -> bool:
+        return any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == STUB_PACKAGE
+            and not node.level
+            and any(a.name == name and a.asname is None for a in node.names)
+            for node in self.tree.body
+        )
 
     def add(self, node: ast.AST, code: str, message: str, hint: str) -> None:
         self.errors.append(
@@ -191,6 +216,7 @@ class _Checker:
             return
 
         run = functions[-1]
+        self._check_not_decorated(run)
         args = run.args
         if (
             len(args.posonlyargs) + len(args.args) != 1
@@ -220,7 +246,83 @@ class _Checker:
                 f"so the name is fixed.",
             )
 
+        self._check_ctx_annotation(only)
         self._check_return_annotation(run)
+
+    def _check_not_decorated(
+        self, run: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> None:
+        """No decorator on `run`. There is no framework to register with.
+
+        A model that has seen other agent libraries writes `@workflow` above
+        `run`, and every decorator it could invent is a name the allowlist does
+        not let it import. Left to pyright that is two errors -- "workflow is
+        not defined" and "untyped function decorator obscures type of function"
+        -- neither of which says that the line should not be there at all.
+        """
+        for decorator in run.decorator_list:
+            self.add(
+                decorator,
+                E_RUN_DECORATED,
+                f"`{RUN_FUNCTION}` cannot be decorated",
+                f"Delete the decorator. Runlace is not a framework you register "
+                f"with: `{RUN_FUNCTION}` is found by name, and the tools it uses "
+                f"are read off `{CTX_PARAM}.<connector>.<tool>(...)` in its body.",
+            )
+
+    def _check_ctx_annotation(self, parameter: ast.arg) -> None:
+        """`ctx` has to be annotated `Ctx`, and `Ctx` has to be the imported one.
+
+        pyright would catch all of this a stage later, but not legibly: one
+        missing import line comes back as nine errors, every one of them a
+        variant of "type of X is unknown", none of them saying which line to
+        write. Here it is one error that names it.
+        """
+        annotation = parameter.annotation
+        if annotation is None:
+            self.add(
+                parameter,
+                E_CTX_ANNOTATION,
+                f"`{CTX_PARAM}` has no type annotation",
+                f"Write `def {RUN_FUNCTION}({CTX_PARAM}: {CTX_TYPE})` and "
+                f"`from {STUB_PACKAGE} import {CTX_TYPE}` above it. Without the "
+                f"annotation pyright knows nothing about your connectors and "
+                f"rejects every line that touches one.",
+            )
+            return
+
+        if not (isinstance(annotation, ast.Name) and annotation.id == CTX_TYPE):
+            self.add(
+                annotation,
+                E_CTX_ANNOTATION,
+                f"`{CTX_PARAM}` must be annotated `{CTX_TYPE}`",
+                f"Write `def {RUN_FUNCTION}({CTX_PARAM}: {CTX_TYPE})`. "
+                f"`{CTX_TYPE}` is generated from the servers you are connected "
+                f"to; it is what gives `{CTX_PARAM}.<connector>.<tool>` a type.",
+            )
+            return
+
+        own = self._own_binding(CTX_TYPE)
+        if own is not None:
+            self.add(
+                own,
+                E_CTX_ANNOTATION,
+                f"`{CTX_TYPE}` is defined in the workflow, shadowing the "
+                f"generated one",
+                f"Delete it and write `from {STUB_PACKAGE} import {CTX_TYPE}`. "
+                f"Runlace generates `{CTX_TYPE}` from your live connectors; a "
+                f"local one describes servers nobody is connected to.",
+            )
+            return
+
+        if not self._imports_from_stubs(CTX_TYPE):
+            self.add(
+                self.tree.body[0] if self.tree.body else self.tree,
+                E_CTX_ANNOTATION,
+                f"`{CTX_TYPE}` is used but never imported from `{STUB_PACKAGE}`",
+                f"Add `from {STUB_PACKAGE} import {CTX_TYPE}` as the first line "
+                f"of the file.",
+            )
 
     def _check_return_annotation(
         self, run: ast.FunctionDef | ast.AsyncFunctionDef
@@ -236,10 +338,18 @@ class _Checker:
             )
             return
 
+        annotated_output = isinstance(returns, ast.Name) and returns.id == OUTPUT_TYPE
+
         if not self.outputs_declared:
+            # `-> Output` without an outputs_schema is legal -- the persistent
+            # stub's `Output` is permissive -- but it still has to be the
+            # imported one, or pyright answers with "Output is not defined" and
+            # no idea where it should have come from.
+            if annotated_output:
+                self._check_output_is_the_generated_one()
             return
 
-        if not (isinstance(returns, ast.Name) and returns.id == OUTPUT_TYPE):
+        if not annotated_output:
             self.add(
                 returns,
                 E_OUTPUT_ANNOTATION,
@@ -276,7 +386,7 @@ class _Checker:
             )
             return
 
-        if not self._imports_output:
+        if not self._imports_from_stubs(OUTPUT_TYPE):
             self.add(
                 self.tree.body[0] if self.tree.body else self.tree,
                 E_OUTPUT_ANNOTATION,
@@ -354,7 +464,8 @@ class _Checker:
             f"`{dotted}` is not on the import allowlist",
             "Allowed imports are: "
             + ", ".join(sorted(ALLOWED_IMPORTS))
-            + f" (plus `from {STUB_PACKAGE} import Ctx`).",
+            + f" (plus `from {STUB_PACKAGE} import {CTX_TYPE}, {OUTPUT_TYPE}`). "
+            f"Connectors are never imported; they arrive on `{CTX_PARAM}`.",
         )
 
     # -- calls -----------------------------------------------------------
@@ -466,13 +577,25 @@ class _Checker:
             isinstance(tool_access, ast.Attribute)
             and tool_access.value is connector_access
         ):
+            misread = self._as_a_tool_name(connector_access.attr)
+            if misread is not None:
+                self.add(
+                    connector_access,
+                    E_UNKNOWN_CONNECTOR,
+                    f"`{connector_access.attr}` is a tool, not a connector",
+                    f"Write `{CTX_PARAM}.{misread}.{connector_access.attr}(...)`. "
+                    f"The first attribute on `{CTX_PARAM}` is always the server, "
+                    f"the second is the tool on it.",
+                )
+                return
             self.add(
                 connector_access,
                 E_CTX_TOOL_NOT_CALLED,
                 f"`{CTX_PARAM}.{connector_access.attr}` must be followed by a tool "
                 f"call",
                 f"Write `{CTX_PARAM}.{connector_access.attr}.<tool>(...)`. A "
-                f"connector cannot be stored in a variable or passed around.",
+                f"connector cannot be stored in a variable or passed around."
+                + self._connector_list(),
             )
             return
 
@@ -486,3 +609,27 @@ class _Checker:
                 f"Write `{CTX_PARAM}.{connector_access.attr}.{tool_access.attr}(...)`. "
                 f"Tools cannot be assigned to variables.",
             )
+
+    # -- what the connector index buys the hints -------------------------
+
+    def _as_a_tool_name(self, attr: str) -> str | None:
+        """The connector `attr` is a tool on, when it is a tool and not a server.
+
+        `ctx.echo(...)` is the mistake a model makes after reading a tool index
+        that lists tools; telling it to write `ctx.echo.<tool>(...)` sends it
+        further away. Ambiguous names get no suggestion: guessing which server
+        was meant would be the same mistake with better manners.
+        """
+        if self.connectors is None or attr in self.connectors:
+            return None
+        owners = [
+            connector
+            for connector, methods in sorted(self.connectors.items())
+            if attr in methods
+        ]
+        return owners[0] if len(owners) == 1 else None
+
+    def _connector_list(self) -> str:
+        if not self.connectors:
+            return ""
+        return " Connected on this machine: " + ", ".join(sorted(self.connectors)) + "."
