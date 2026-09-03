@@ -1,0 +1,28 @@
+{
+  "numStartups": 12,
+  "mcpServers": {
+    "global-stdio": {
+      "command": "node",
+      "args": ["server.js"],
+      "env": { "TOKEN": "abc" }
+    },
+    "remote-api": {
+      "type": "http",
+      "url": "https://example.test/mcp",
+      "headers": { "Authorization": "Bearer xyz" }
+    },
+    "broken-no-command": {
+      "env": { "A": "1" }
+    }
+  },
+  "projects": {
+    "/Users/someone/work": {
+      "mcpServers": {
+        "project-sse": {
+          "type": "sse",
+          "url": "https://example.test/sse"
+        }
+      }
+    }
+  }
+}
