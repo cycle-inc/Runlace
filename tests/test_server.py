@@ -53,7 +53,7 @@ def tools_of(server: MCPServer) -> dict[str, Any]:
     return {t.name: t for t in asyncio.run(server.list_tools())}
 
 
-def test_the_server_exposes_the_seven_tools(
+def test_the_server_exposes_the_eight_tools(
     home: tuple[RunlacePaths, Connection]
 ) -> None:
     paths, _ = home
@@ -61,6 +61,7 @@ def test_the_server_exposes_the_seven_tools(
     tools = tools_of(server)
     assert set(tools) == {
         "get_skill",
+        "add_connector",
         "create_workflow",
         "edit_workflow",
         "list_workflows",
@@ -401,6 +402,56 @@ def test_a_dry_run_is_not_stopped_by_the_confirm_gate(
     assert result["ok"] is True
     assert result["dry_run"] is True
     assert result["simulated"] == [{"connector": "gmail", "tool": "send_email"}]
+
+
+def test_add_connector_declares_its_arguments(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """No `command`: this tool cannot make the machine run a program."""
+    paths, _ = home
+    schema = tools_of(build_server(paths))["add_connector"].input_schema
+    assert set(schema["required"]) == {"name", "url"}
+    assert set(schema["properties"]) == {
+        "name",
+        "url",
+        "headers",
+        "transport",
+        "confirm",
+    }
+
+
+def test_add_connector_asks_before_it_touches_the_config(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """Same shape of gate as run_workflow, seen the way the agent sees it."""
+    paths, _ = home
+    before = paths.config.read_text(encoding="utf-8")
+
+    result = call(
+        build_server(paths), "add_connector", name="notion", url="https://n.test/mcp"
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "needs-confirmation"
+    assert result["connector"]["url"] == "https://n.test/mcp"
+    assert paths.config.read_text(encoding="utf-8") == before
+
+
+def test_add_connector_never_writes_a_token_the_agent_was_handed(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, _ = home
+    result = call(
+        build_server(paths),
+        "add_connector",
+        name="notion",
+        url="https://n.test/mcp",
+        headers={"Authorization": "Bearer secret_abc"},
+        confirm=True,
+    )
+
+    assert result["code"] == "literal-secret"
+    assert "secret_abc" not in paths.config.read_text(encoding="utf-8")
 
 
 # -- the transport ---

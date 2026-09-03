@@ -422,6 +422,32 @@ Once imported, disable the server in Open WebUI. It stays in the config, so the
 bridge can still read it, but the model can no longer call it directly — it has
 to go through Runlace, with the confirm gate and the journal.
 
+### `add_connector`, from the chat
+
+The CLI covers the developer. The eighth tool covers their user: "connect my
+Notion" in the chat, no terminal. Same core as `runlace add` — same merge, same
+refusal to write a secret down — behind the same shape of gate as
+`run_workflow`:
+
+```
+add_connector(name="notion", url="https://mcp.notion.com/mcp")
+  -> {code: "needs-confirmation", action: "add", connector: {...}, needs_env: []}
+add_connector(..., confirm=True)
+  -> {ok: true, attr: "notion", tools: 19, next: "Call get_skill again ..."}
+```
+
+Two deliberate narrowings compared to the CLI:
+
+- **No `command`.** A URL only reaches outwards; a command is "run this program
+  on my machine", and the value would be arriving from a model that may have
+  read it off a web page a moment earlier. Local servers are added from a shell.
+- **A literal token is refused here too**, and the error tells the agent to ask
+  for an `export` rather than for the token itself. It has no reason to pass
+  through the conversation.
+
+`runlace serve` reads the environment once, at startup, so a newly exported
+variable needs a restart. The tool says so when it hands back `needs_env`.
+
 ## A chat UI to drive it with
 
 `docker/chat/` brings up [Open WebUI](https://github.com/open-webui/open-webui)

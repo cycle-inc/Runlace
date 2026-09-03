@@ -185,6 +185,13 @@ def unresolved_references(connectors: list[Connector]) -> dict[str, list[str]]:
     return missing
 
 
+def _stored(paths: RunlacePaths) -> list[Connector]:
+    """The connectors on disk, or none. A home without a config is an empty one."""
+    if not paths.config.exists():
+        return []
+    return read_config(paths.config)
+
+
 def _persist(
     paths: RunlacePaths, connectors: list[Connector], *, timeout: float
 ) -> InitReport:
@@ -208,7 +215,7 @@ def add_connectors(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> tuple[MergeResult, InitReport]:
     """Merge ``incoming`` into the stored config and re-discover everything."""
-    merged = merge(read_config(paths.config), incoming)
+    merged = merge(_stored(paths), incoming)
     return merged, _persist(paths, merged.connectors, timeout=timeout)
 
 
@@ -224,7 +231,7 @@ def remove_connector(
     the next run is refused rather than half-executed. That is D1 doing its job,
     not an oversight.
     """
-    existing = read_config(paths.config)
+    existing = _stored(paths)
     kept = [c for c in existing if c.name != name]
     result = MergeResult(connectors=kept)
     if len(kept) == len(existing):
@@ -423,3 +430,141 @@ def build_connector(
     return Connector(
         name=name, attr=attr, transport=transport, url=url, headers=headers
     )
+
+
+# -- adding one from the chat ---
+
+# `runlace add` can launch a local process; this cannot, and the difference is
+# deliberate. A command in config.json is "run this on my machine every time a
+# workflow touches it", and the value would be arriving from a model that may
+# have read it off a web page a moment earlier. A URL only reaches outwards.
+# Anyone who genuinely wants a stdio server can type it in their own shell.
+_REMOTE_ONLY = (
+    "This tool only adds servers reachable over HTTP. For a local one launched "
+    "by a command, run `runlace add <name> --command ... --arg ...` in a shell."
+)
+
+
+def add_connector(
+    paths: RunlacePaths,
+    *,
+    name: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    transport: str = "http",
+    confirm: bool = False,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Add one HTTP connector, behind a confirmation gate. Returns JSON.
+
+    The body of the ``add_connector`` MCP tool, kept here so it can be tested
+    without a server and so it shares the merge, the secret check and the
+    re-discovery with the CLI rather than reimplementing them.
+
+    Nothing is written unless ``confirm`` is true.
+    """
+    if transport not in ("http", "sse"):
+        return {
+            "ok": False,
+            "code": "bad-transport",
+            "error": f"`{transport}` is not a transport this tool can add",
+            "hint": f"Use `http`, or `sse` for an older server. {_REMOTE_ONLY}",
+        }
+
+    try:
+        connector = build_connector(
+            name, url=url, headers=headers or {}, transport=transport
+        )
+    except LiteralSecret as exc:
+        reference = exc.suggestion.strip('"')
+        variable = reference.removeprefix("${").removesuffix("}")
+        return {
+            "ok": False,
+            "code": "literal-secret",
+            "error": str(exc),
+            "hint": (
+                f"Ask the human to run `export {variable}=<token>` in the shell "
+                f"that starts Runlace, then call this again with `{reference}` as "
+                "the header value. Do not ask them to paste the token to you: it "
+                "does not need to pass through this conversation."
+            ),
+        }
+    except ValueError as exc:
+        return {"ok": False, "code": "bad-name", "error": str(exc)}
+
+    planned = merge(_stored(paths), [connector])
+    if not planned.changed:
+        return {
+            "ok": False,
+            "code": "name-collision",
+            "error": planned.warnings[0] if planned.warnings else "nothing to add",
+            "hint": "Pick a different name for this connector.",
+        }
+
+    needs_env = unresolved_references([connector]).get(name, [])
+    action = "replace" if planned.replaced else "add"
+
+    if not confirm:
+        return {
+            "ok": False,
+            "code": "needs-confirmation",
+            "action": action,
+            "connector": {
+                "name": name,
+                "attr": connector.attr,
+                "transport": transport,
+                "url": url,
+                "headers": sorted(connector.headers),
+            },
+            "needs_env": needs_env,
+            "hint": (
+                "Show the human this URL and ask whether to add it. Adding a "
+                "connector widens what every future workflow on this machine can "
+                "reach. Call again with confirm=true once they agree."
+                + (
+                    ""
+                    if not needs_env
+                    else " They must also export "
+                    + ", ".join(needs_env)
+                    + " and restart `runlace serve`, which reads the environment "
+                    "once at startup."
+                )
+            ),
+        }
+
+    merged, report = add_connectors(paths, [connector], timeout=timeout)
+    row = next((r for r in report.rows if r.name == name), None)
+    warnings = [*merged.warnings, *report.warnings]
+
+    if row is None or not row.status.startswith("connected"):
+        return {
+            "ok": False,
+            "code": "connector-unreachable",
+            "connector": name,
+            "status": row.status if row is not None else "not discovered",
+            "error": f"{name} is written to config.json but did not answer",
+            "needs_env": needs_env,
+            "warnings": warnings,
+            "hint": (
+                "Check the url and the credential. Fix it by calling this tool "
+                "again with the same name -- it replaces rather than duplicates."
+                + (
+                    ""
+                    if not needs_env
+                    else " " + ", ".join(needs_env) + " is not set in this process."
+                )
+            ),
+        }
+
+    return {
+        "ok": True,
+        "connector": name,
+        "attr": connector.attr,
+        "action": "replaced" if merged.replaced else "added",
+        "tools": row.tools,
+        "warnings": warnings,
+        "next": (
+            f"Call get_skill again: the stubs were regenerated and "
+            f"ctx.{connector.attr} now exists, with its tools and their risk."
+        ),
+    }

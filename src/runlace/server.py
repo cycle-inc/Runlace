@@ -14,6 +14,7 @@ from typing import Any, Iterator
 
 from mcp.server.mcpserver import MCPServer
 
+from .connect_cmd import add_connector as _add_connector
 from .db import Connection, connect
 from .paths import RunlacePaths, paths as default_paths
 from .runs import run_workflow as _run_workflow
@@ -30,7 +31,8 @@ Runlace stores deterministic, replayable workflows over this machine's MCP
 servers. Call get_skill first: it returns the calling convention and the exact
 connectors and tools available here. Then create_workflow with the code,
 dry_run_workflow to check it really works, edit_workflow to fix what it turns
-up, and run_workflow to execute it for real.
+up, and run_workflow to execute it for real. If what the human wants is not
+among the connectors get_skill lists, add_connector connects a new server.
 """
 
 
@@ -58,6 +60,54 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
         """
         with session() as conn:
             return build_skill(conn, home)
+
+    # Deliberately sync: discovery calls asyncio.run, which cannot happen inside
+    # a running loop. The SDK runs sync tools on a worker thread, so this is the
+    # spelling that works -- an `async def` here would raise at the first call.
+    @server.tool()
+    def add_connector(
+        name: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        transport: str = "http",
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Connect a remote MCP server so workflows can use its tools.
+
+        Use this when the human wants to reach something Runlace does not have
+        yet -- get_skill lists what it does have. `name` becomes `ctx.<name>` in
+        workflow code. `url` is the server's MCP endpoint, in full.
+
+        Call this WITHOUT `confirm` first. It writes nothing and returns
+        {code: "needs-confirmation"} with what it would add; show the human the
+        URL and call again with confirm=True only after they agree. A connector
+        widens what every future workflow on this machine can reach, so this is
+        their decision, not yours.
+
+        Credentials are never stored here. Put a `${VAR}` reference in `headers`
+        -- {"Authorization": "Bearer ${GITHUB_TOKEN}"} -- and the value is read
+        from the environment when the connection opens. A literal token is
+        refused: config.json is a file on disk. Never ask the human to paste a
+        token into the conversation; ask them to export it and restart
+        `runlace serve`, which reads the environment once at startup.
+
+        Only HTTP servers. A local one launched by a command is added from a
+        shell with `runlace add <name> --command ...`, because that is a
+        decision to run a program on the human's machine.
+
+        On success returns {ok: true, attr, tools} -- then call get_skill again,
+        the stubs have been regenerated. On failure, `code` is one of
+        needs-confirmation, literal-secret, bad-name, bad-transport,
+        name-collision, connector-unreachable.
+        """
+        return _add_connector(
+            home,
+            name=name,
+            url=url,
+            headers=headers,
+            transport=transport,
+            confirm=confirm,
+        )
 
     @server.tool()
     def create_workflow(

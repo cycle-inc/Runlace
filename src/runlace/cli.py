@@ -32,6 +32,20 @@ from .typecheck import check_stubs
 
 OPEN_WEBUI_TOKEN_ENV = "OPEN_WEBUI_TOKEN"
 
+# Every command that re-discovers needs this, not just `serve`. A `${VAR}` is
+# resolved by whatever process opens the connection, so running `runlace remove`
+# in a shell without the tokens exported makes every other server "not answer"
+# -- and a server that did not answer has its tools pruned.
+EnvFiles = Annotated[
+    list[Path] | None,
+    typer.Option(
+        "--env-file",
+        help="File of KEY=VALUE lines holding the tokens your connectors "
+        "reference. Repeatable. Values are never printed.",
+        show_default=False,
+    ),
+]
+
 app = typer.Typer(
     add_completion=False,
     help="Deterministic, replayable workflows over your MCP servers.",
@@ -63,9 +77,11 @@ def init(
     verify: Annotated[
         bool, typer.Option(help="Typecheck the generated stubs with pyright.")
     ] = True,
+    env_file: EnvFiles = None,
 ) -> None:
     """Set up ~/.runlace, discover your MCP servers, and generate typed stubs."""
     paths = runlace_paths()
+    _load_env_files(env_file)
     sources = list(from_) if from_ else _prompt_for_sources(assume_yes=yes)
     if not sources:
         typer.secho("No MCP config selected. Nothing to import.", fg=typer.colors.YELLOW)
@@ -121,9 +137,11 @@ def add(
     timeout: Annotated[
         float, typer.Option(help="Seconds to wait for each server to answer tools/list.")
     ] = 30.0,
+    env_file: EnvFiles = None,
 ) -> None:
     """Add one MCP server to ~/.runlace, keeping the ones already there."""
     paths = _existing_home()
+    _load_env_files(env_file)
     try:
         connector = build_connector(
             name,
@@ -163,6 +181,7 @@ def import_(
     timeout: Annotated[
         float, typer.Option(help="Seconds to wait for each server to answer tools/list.")
     ] = 30.0,
+    env_file: EnvFiles = None,
 ) -> None:
     """Copy a chat UI's MCP servers into ~/.runlace.
 
@@ -171,6 +190,7 @@ def import_(
     the UI serves over OpenAPI rather than MCP.
     """
     paths = _existing_home()
+    _load_env_files(env_file)
     token = os.environ.get(token_env, "")
     if not token:
         typer.secho(
@@ -210,6 +230,7 @@ def remove(
     timeout: Annotated[
         float, typer.Option(help="Seconds to wait for each server to answer tools/list.")
     ] = 30.0,
+    env_file: EnvFiles = None,
 ) -> None:
     """Drop one MCP server from ~/.runlace.
 
@@ -217,6 +238,7 @@ def remove(
     rather than half-executed.
     """
     paths = _existing_home()
+    _load_env_files(env_file)
     result, report = remove_connector(paths, name, timeout=timeout)
     if report is None:
         for warning in result.warnings:
@@ -231,9 +253,11 @@ def sync(
     timeout: Annotated[
         float, typer.Option(help="Seconds to wait for each server to answer tools/list.")
     ] = 30.0,
+    env_file: EnvFiles = None,
 ) -> None:
     """Re-discover your MCP servers and report which stored workflows broke."""
     paths = runlace_paths()
+    _load_env_files(env_file)
     if not paths.config.exists():
         typer.secho(
             f"No Runlace home at {paths.home}. Run `runlace init` first.",
@@ -304,15 +328,7 @@ def serve(
             help="Interface to bind --http to. Use 0.0.0.0 to let a container reach it.",
         ),
     ] = "127.0.0.1",
-    env_file: Annotated[
-        list[Path] | None,
-        typer.Option(
-            "--env-file",
-            help="File of KEY=VALUE lines holding the tokens your connectors "
-            "reference. Repeatable. Values are never printed.",
-            show_default=False,
-        ),
-    ] = None,
+    env_file: EnvFiles = None,
 ) -> None:
     """Start the Runlace MCP server so any MCP host can add it."""
     paths = runlace_paths()

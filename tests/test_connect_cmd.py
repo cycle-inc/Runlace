@@ -7,17 +7,23 @@ anything -- discovery is somebody else's test.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from runlace.config import Connector
+from runlace import connect_cmd
+from runlace.config import Connector, read_config, write_config
 from runlace.connect_cmd import (
     LiteralSecret,
+    add_connector,
     build_connector,
     env_placeholder,
     merge,
     parse_open_webui,
     unresolved_references,
 )
+from runlace.init_cmd import ConnectorRow, InitReport
+from runlace.paths import RunlacePaths
 
 
 def connector(name: str, **kw: object) -> Connector:
@@ -275,3 +281,120 @@ def test_a_reference_nobody_exported_is_named_before_the_connection_fails(
     ])
 
     assert missing == {"github": ["RUNLACE_GITHUB_AUTHORIZATION"]}
+
+
+# -- the add_connector tool ---
+
+
+def home(tmp_path: Path, existing: list[Connector] | None = None) -> RunlacePaths:
+    paths = RunlacePaths(tmp_path / "home")
+    paths.create()
+    write_config(paths.config, existing or [])
+    return paths
+
+
+def test_the_tool_writes_nothing_until_a_human_has_agreed(tmp_path: Path) -> None:
+    paths = home(tmp_path)
+
+    result = add_connector(paths, name="github", url="https://x.test/mcp")
+
+    assert result["code"] == "needs-confirmation"
+    assert result["action"] == "add"
+    assert result["connector"]["attr"] == "github"
+    assert read_config(paths.config) == []
+
+
+def test_confirming_persists_and_sends_the_agent_back_to_get_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = home(tmp_path)
+    monkeypatch.setattr(connect_cmd, "add_connectors", fake_discovery(tools=47))
+
+    result = add_connector(
+        paths, name="github", url="https://x.test/mcp", confirm=True
+    )
+
+    assert result["ok"] is True
+    assert result["action"] == "added"
+    assert result["tools"] == 47
+    assert "get_skill" in result["next"]
+
+
+def test_a_server_that_does_not_answer_is_not_reported_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It is still written down -- calling again with a fixed url replaces it."""
+    paths = home(tmp_path)
+    monkeypatch.setattr(connect_cmd, "add_connectors", fake_discovery(status="error"))
+
+    result = add_connector(
+        paths, name="github", url="https://x.test/mcp", confirm=True
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "connector-unreachable"
+
+
+def test_the_tool_will_not_launch_a_local_command(tmp_path: Path) -> None:
+    """A url only reaches outwards; a command runs a program on the machine."""
+    result = add_connector(
+        home(tmp_path), name="files", url="npx", transport="stdio"
+    )
+
+    assert result["code"] == "bad-transport"
+    assert "runlace add" in result["hint"]
+
+
+def test_the_tool_refuses_a_literal_token_and_says_what_to_export(
+    tmp_path: Path,
+) -> None:
+    result = add_connector(
+        home(tmp_path),
+        name="github",
+        url="https://x.test/mcp",
+        headers={"Authorization": "Bearer ghp_real"},
+    )
+
+    assert result["code"] == "literal-secret"
+    assert "export RUNLACE_GITHUB_AUTHORIZATION=" in result["hint"]
+    assert "ghp_real" not in result["hint"]
+
+
+def test_the_tool_names_the_variable_the_serving_process_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    result = add_connector(
+        home(tmp_path),
+        name="github",
+        url="https://x.test/mcp",
+        headers={"Authorization": "Bearer ${GITHUB_TOKEN}"},
+    )
+
+    assert result["needs_env"] == ["GITHUB_TOKEN"]
+    assert "restart" in result["hint"]
+
+
+def test_the_tool_refuses_a_name_that_collides_on_ctx(tmp_path: Path) -> None:
+    paths = home(tmp_path, [http("my_server")])
+
+    result = add_connector(paths, name="my-server", url="https://x.test/mcp")
+
+    assert result["code"] == "name-collision"
+
+
+def fake_discovery(*, tools: int = 1, status: str = "connected"):
+    """Stand in for add_connectors: the real one opens a network connection."""
+
+    def call(paths: RunlacePaths, incoming: list[Connector], *, timeout: float):
+        merged = connect_cmd.merge(read_config(paths.config), incoming)
+        write_config(paths.config, merged.connectors)
+        report = InitReport(home=paths.home)
+        report.rows = [
+            ConnectorRow(name=c.name, transport=c.transport, tools=tools, status=status)
+            for c in incoming
+        ]
+        return merged, report
+
+    return call
