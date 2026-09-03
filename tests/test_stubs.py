@@ -25,7 +25,7 @@ def tool(**overrides: object) -> ToolSpec:
 
 def test_method_signature_is_keyword_only() -> None:
     source, _ = render_connector_stub(ConnectorSpec("everything", "everything", [tool()]))
-    assert "def echo(self, *, message: str) -> object:" in source
+    assert "def echo(self, *, message: str) -> Any:" in source
 
 
 def test_class_name_comes_from_the_ctx_attribute() -> None:
@@ -68,7 +68,7 @@ def test_optional_parameters_get_a_stub_default() -> None:
             ],
         )
     )
-    assert "def echo(self, *, a: str, b: int = ...) -> object:" in source
+    assert "def echo(self, *, a: str, b: int = ...) -> Any:" in source
 
 
 def test_reserved_word_parameter_is_renamed_and_documented() -> None:
@@ -89,7 +89,7 @@ def test_reserved_word_parameter_is_renamed_and_documented() -> None:
             ],
         )
     )
-    assert "def list_transactions(self, *, from_: str, to: str) -> object:" in source
+    assert "def list_transactions(self, *, from_: str, to: str) -> Any:" in source
     assert 'from_ maps to the JSON key "from".' in source
 
 
@@ -97,12 +97,15 @@ def test_tool_with_no_parameters_takes_no_arguments() -> None:
     source, _ = render_connector_stub(
         ConnectorSpec("s", "s", [tool(input_schema={"type": "object"})])
     )
-    assert "def echo(self) -> object:" in source
+    assert "def echo(self) -> Any:" in source
 
 
-def test_missing_output_schema_returns_object() -> None:
+def test_missing_output_schema_returns_any() -> None:
+    """Nothing was promised, so nothing is claimed -- and `Any` needs importing."""
     source, _ = render_connector_stub(ConnectorSpec("s", "s", [tool()]))
-    assert "-> object:" in source
+    assert "-> Any:" in source
+    imported = source.split("from typing import ")[1].splitlines()[0]
+    assert "Any" in imported.split(", ")
 
 
 def test_output_schema_becomes_the_return_type() -> None:

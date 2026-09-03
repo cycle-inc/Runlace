@@ -88,11 +88,18 @@ def render_connector_stub(connector: ConnectorSpec) -> tuple[str, list[str]]:
         if shape.fields:
             renderer.add_typed_dict(f"{hint}Input", shape.fields)
 
-        return_type = (
-            renderer.render(tool.output_schema, f"{hint}Output")
-            if tool.output_schema
-            else "object"
-        )
+        if tool.output_schema:
+            return_type = renderer.render(tool.output_schema, f"{hint}Output")
+        else:
+            # D2 derives return types from the schemas; with no output schema
+            # there is nothing to derive, and `Any` is how that is spelled.
+            # `object` would read as stricter but is not: it forces the author
+            # to write `cast(dict[str, object], ...)` to touch the value, and
+            # that cast is an unchecked promise where `Any` is an admitted
+            # unknown. See `runlace.sessions.tool_payload` for what actually
+            # arrives.
+            return_type = "Any"
+            renderer.typing_imports.add("Any")
 
         methods.append(
             "\n".join(

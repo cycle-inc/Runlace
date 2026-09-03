@@ -188,6 +188,14 @@ Two things M1 needs that `SPEC.md` does not pin down:
   plaintext in `config.json`. The spec does not say where the secret should
   live, so it lives in the environment and the config keeps a reference,
   resolved at connection time.
+- **A tool with no `outputSchema` returns `Any`, not `object`.** D2 derives
+  return types from the schemas, and there is nothing to derive from a schema
+  that does not exist. This is not a rare gap: of the four servers tried so far,
+  three declare a schema on every tool (24/24) and GitHub declares one on none
+  (0/47). `object` reads as the stricter choice but is not — it cannot be
+  indexed, so the author must write `cast(dict[str, object], ...)`, which
+  pyright accepts on their word alone. That buys no safety over `Any` and costs
+  a ritual on every call, plus a false note of reassurance to the next reader.
 - **Schema-hash scope.** The per-tool hash covers `inputSchema` and
   `outputSchema` only. A server rewording a tool description will not
   invalidate stored workflows; changing a parameter will.
@@ -250,7 +258,12 @@ And these in M3:
   create time rather than letting it fail at run time.
 - **What a tool call returns to the workflow**: `structuredContent` when the
   tool declares an output schema — that is what the stub promised — otherwise
-  the text block, or the list of them. An `isError` result raises inside the
+  the text blocks, with a lone one parsed if it holds a JSON object or array.
+  Servers that declare no schema still answer in JSON; they just have nowhere
+  to put it but a text block. Only objects and arrays, and only when there is
+  exactly one block: `"42"` stays the string it was, and GitHub's
+  `get_file_contents` answers with a sentence *and* the file, which parsing the
+  first block would have thrown away. An `isError` result raises inside the
   workflow, which may catch it; the step is journaled as an error either way.
 - **Sessions are opened up front**, one per connector the workflow uses, before
   any workflow code runs. A server that is down fails the run before the first

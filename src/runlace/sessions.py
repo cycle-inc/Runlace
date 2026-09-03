@@ -68,15 +68,34 @@ def tool_payload(result: CallToolResult) -> Any:
     """What the workflow receives back from a tool call.
 
     Structured content when the tool declares an output schema -- that is what
-    the generated stub promised the workflow. Otherwise the text blocks, which
-    the stubs type as ``object`` precisely because their shape is not promised.
+    the generated stub promised the workflow. Otherwise the text blocks, with a
+    lone one parsed if it turns out to hold JSON.
     """
     if result.structured_content is not None:
         return result.structured_content
     texts = [block.text for block in result.content if isinstance(block, TextContent)]
     if len(texts) == len(result.content) and texts:
-        return texts[0] if len(texts) == 1 else texts
+        return _parsed(texts[0]) if len(texts) == 1 else texts
     return [json.loads(block.model_dump_json()) for block in result.content]
+
+
+def _parsed(text: str) -> Any:
+    """``text`` as a dict or a list if that is what it holds, else unchanged.
+
+    Servers that declare no output schema still overwhelmingly answer with JSON
+    serialised into a text block -- every one of GitHub's 47 tools does. Handing
+    the workflow the string would make it call ``json.loads`` itself, which D3
+    allows but which is busywork built on a guess.
+
+    Only a dict or a list. A tool whose answer is genuinely a string must keep
+    it: ``"42"`` is an id, not the number 42, and ``"null"`` is a word. Parsing
+    those would be a silent corruption rather than a convenience.
+    """
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return text
+    return value if isinstance(value, (dict, list)) else text
 
 
 def _error_text(result: CallToolResult) -> str:

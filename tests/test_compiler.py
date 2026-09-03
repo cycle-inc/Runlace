@@ -264,16 +264,40 @@ def test_a_return_value_matching_outputs_schema_compiles(
     assert result.ok, [str(e) for e in result.errors]
 
 
-def test_an_unnarrowed_object_result_fails_at_typecheck(
+def test_a_result_with_no_output_schema_is_usable_without_a_cast(
     home: tuple[RunlacePaths, Connection]
 ) -> None:
-    """Tools with no output schema return `object`; using one blind is an error."""
+    """`Any`, not `object`: a shape nobody promised is unknown, not opaque.
+
+    This is a deliberate loss of a diagnostic. Under `object` the line below was
+    a typecheck error -- but the fix it demanded was `cast(float, balance) * 2`,
+    which pyright accepts on the author's word alone. The check never verified
+    anything; it only charged a ritual for saying "trust me", and charged it on
+    every call to a server like GitHub, where no tool declares an output schema.
+    """
     paths, conn = home
     code = (
         "from runlace_types import Ctx\n\n\n"
         "def run(ctx: Ctx) -> dict[str, object]:\n"
         "    balance = ctx.pennylane.get_balance()\n"
         '    return {"doubled": balance * 2}\n'
+    )
+    result = compile_workflow(
+        conn, paths.types, name="probe", code=code, inputs_schema=INPUTS
+    )
+    assert result.ok, [str(e) for e in result.errors]
+
+
+def test_a_declared_output_schema_is_still_enforced(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """`Any` is confined to tools that promised nothing; it must not spread."""
+    paths, conn = home
+    code = (
+        "from runlace_types import Ctx\n\n\n"
+        "def run(ctx: Ctx) -> dict[str, object]:\n"
+        "    rows = ctx.pennylane.list_transactions(from_='2024-01-01', to='2024-02-01')\n"
+        '    return {"first": rows.no_such_attribute}\n'
     )
     result = compile_workflow(
         conn, paths.types, name="probe", code=code, inputs_schema=INPUTS

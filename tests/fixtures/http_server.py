@@ -6,6 +6,7 @@ Run as: python http_server.py <port>
 from __future__ import annotations
 
 import sys
+import time
 
 import uvicorn
 from mcp.server.mcpserver import MCPServer
@@ -17,6 +18,13 @@ server = MCPServer("probe")
 def ping(message: str) -> str:
     """Replies with the message."""
     return message
+
+
+@server.tool()
+def slow(seconds: float) -> str:
+    """Answers after a delay, to exercise the transport's read timeout."""
+    time.sleep(seconds)
+    return f"waited {seconds}"
 
 
 if __name__ == "__main__":

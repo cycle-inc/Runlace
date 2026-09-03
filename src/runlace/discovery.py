@@ -12,14 +12,17 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Literal
 
-# The MCP SDK ships and uses httpx2; its own docs say to build the client with
-# it when you need custom headers.
-from httpx2 import AsyncClient
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import get_default_environment, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import Tool
+
+# The factory `streamable_http_client` itself uses when it builds its own
+# client. Going through it is what keeps a connector with headers on the same
+# footing as one without: 300s read for long-lived streams, and redirects
+# followed. A bare `httpx2.AsyncClient` would default to 5s and neither.
+from mcp.shared._httpx_utils import create_mcp_http_client
 
 from .config import Connector, MissingEnvVars
 
@@ -101,10 +104,11 @@ async def open_transport(connector: Connector) -> AsyncIterator[tuple[Any, Any]]
         return
 
     async with AsyncExitStack() as stack:
-        # Without custom headers, let the SDK build a client with its own
-        # recommended timeouts.
+        # Without custom headers, let the SDK build the client itself.
         http_client = (
-            await stack.enter_async_context(AsyncClient(headers=connector.headers))
+            await stack.enter_async_context(
+                create_mcp_http_client(headers=connector.headers)
+            )
             if connector.headers
             else None
         )

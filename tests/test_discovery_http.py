@@ -18,6 +18,7 @@ import pytest
 
 from runlace.config import Connector
 from runlace.discovery import discover_one
+from runlace.sessions import open_sessions
 
 SERVER = Path(__file__).parent / "fixtures" / "http_server.py"
 
@@ -66,7 +67,7 @@ def remote(url: str, headers: dict[str, str] | None = None) -> Connector:
 def test_discovers_tools_over_streamable_http(http_server: str) -> None:
     result = asyncio.run(discover_one(remote(http_server), timeout=30))
     assert result.status == "connected", result.detail
-    assert [t.name for t in result.tools] == ["ping"]
+    assert [t.name for t in result.tools] == ["ping", "slow"]
 
 
 def test_static_header_auth_is_sent(http_server: str) -> None:
@@ -75,7 +76,25 @@ def test_static_header_auth_is_sent(http_server: str) -> None:
         discover_one(remote(http_server, {"Authorization": "Bearer test"}), timeout=30)
     )
     assert result.status == "connected", result.detail
-    assert [t.name for t in result.tools] == ["ping"]
+    assert [t.name for t in result.tools] == ["ping", "slow"]
+
+
+def test_a_connector_with_headers_keeps_the_sdks_read_timeout(http_server: str) -> None:
+    """The regression this exists to prevent.
+
+    Passing our own client to `streamable_http_client` opts out of the one it
+    would have built, and a bare `httpx2.AsyncClient` reads for 5 seconds where
+    the SDK's reads for 300. Since headers are the only reason we build a client
+    at all, that made every authenticated remote server -- D8's whole case --
+    the one kind that timed out on a slow tool.
+    """
+    connector = remote(http_server, {"Authorization": "Bearer test"})
+
+    async def call_slow() -> object:
+        async with open_sessions([connector], timeout=60) as sessions:
+            return await sessions.call("probe", "slow", {"seconds": 6.5})
+
+    assert "waited 6.5" in str(asyncio.run(call_slow()))
 
 
 def test_wrong_path_is_reported_as_an_error(http_server: str) -> None:
