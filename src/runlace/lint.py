@@ -63,6 +63,12 @@ DYNAMIC_ACCESS_CALLS = frozenset(
 CTX_PARAM = "ctx"
 RUN_FUNCTION = "run"
 
+# The one `ctx` attribute that is not a connector (D7). Both the lint and the
+# extractor have to know it, and they have to agree: if only one of them does,
+# `ctx.inputs.get("branch", "main")` lints clean and then gets extracted as a
+# call to a connector named `inputs`.
+INPUTS_ATTR = "inputs"
+
 E_SYNTAX = "syntax-error"
 E_FORBIDDEN_IMPORT = "forbidden-import"
 E_IMPORT_NOT_ALLOWED = "import-not-allowed"
@@ -392,7 +398,7 @@ class _Checker:
 
     def _check_ctx_attribute(self, connector_access: ast.Attribute) -> None:
         """`ctx.<connector>` must continue into `.<tool>(...)`."""
-        if connector_access.attr == "inputs":
+        if connector_access.attr == INPUTS_ATTR:
             return
         if connector_access.attr.startswith("__"):
             # `ctx.__dict__` and friends are already reported as dunder access.

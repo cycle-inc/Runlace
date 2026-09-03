@@ -15,6 +15,8 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 
+from .lint import CTX_PARAM, INPUTS_ATTR
+
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -44,8 +46,14 @@ def extract_tool_calls(code: str) -> list[ToolCall]:
             continue
         if not (
             isinstance(connector_access.value, ast.Name)
-            and connector_access.value.id == "ctx"
+            and connector_access.value.id == CTX_PARAM
         ):
+            continue
+        if connector_access.attr == INPUTS_ATTR:
+            # `ctx.inputs` is a dict, not a connector, so `ctx.inputs.get(k, d)`
+            # is ordinary Python that the lint deliberately allows. Reading it
+            # as a call to a connector named `inputs` rejects the most natural
+            # way to write an optional input.
             continue
         calls.append(
             ToolCall(

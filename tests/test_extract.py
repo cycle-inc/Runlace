@@ -74,6 +74,27 @@ def test_ctx_inputs_is_not_a_tool_call() -> None:
     assert extract_tool_calls(code) == []
 
 
+def test_a_method_call_on_ctx_inputs_is_not_a_tool_call() -> None:
+    """`ctx.inputs.get(k, default)` is a dict method, not `ctx.<connector>.<tool>`.
+
+    Found by handing the task "an input defaulting to 5" to a model: it reached
+    for `.get`, which the lint allows, and extraction then reported "there is no
+    connector called `inputs`". Subscripting was already covered here; calling a
+    method on it was not, and that is the shape the sentence "with a default"
+    produces.
+    """
+    code = (
+        "def run(ctx):\n"
+        "    rows = ctx.github.list_commits(\n"
+        "        owner=ctx.inputs['owner'],\n"
+        "        sha=ctx.inputs.get('branch', 'main'),\n"
+        "        perPage=ctx.inputs.get('count', 5),\n"
+        "    )\n"
+        "    return {'n': len(rows)}\n"
+    )
+    assert unique_tools(extract_tool_calls(code)) == [("github", "list_commits")]
+
+
 def test_attribute_calls_on_other_objects_are_ignored() -> None:
     code = (
         "import json\n"
