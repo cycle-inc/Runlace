@@ -247,6 +247,19 @@ _TYPECHECK_DEFAULT_HINT = (
 
 
 def _typecheck_hint(rule: str | None, message: str) -> str:
+    if 'is not assignable to return type "Output"' in message and "invariant" in message:
+        # The list is built in a variable, so pyright infers
+        # `list[dict[str, ...]]` and a list of TypedDicts is not that -- lists
+        # are invariant. Built inside the `return`, the declared Output gives
+        # each dict literal its expected type and the same code is accepted.
+        # The generic "fix one or the other" hint sends the agent rewriting a
+        # schema that was already right.
+        return (
+            "Your value and the outputs_schema agree; this is a variance "
+            "artifact. Build the list inside the `return` statement rather than "
+            "in a variable first, so pyright checks each item against the "
+            "schema instead of inferring a plain list of dicts."
+        )
     if 'not a defined key in "Inputs"' in message:
         return (
             "That key is not in the inputs_schema you declared. Add it to "

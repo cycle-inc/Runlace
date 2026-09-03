@@ -240,6 +240,66 @@ def test_a_return_value_that_contradicts_outputs_schema_fails(
     assert [e.line for e in result.errors] == [5]
 
 
+ROWS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rows": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            },
+        }
+    },
+    "required": ["rows"],
+}
+
+
+def test_a_list_of_objects_built_in_a_variable_gets_the_variance_hint(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The schema is right and the value is right; only where it was built is wrong.
+
+    A blind-tested model hit this twice. `rows = [...]` is inferred as
+    `list[dict[str, str]]`, and a list of TypedDicts is not that, because lists
+    are invariant. "Fix one or the other so they agree" sends the agent
+    rewriting a schema that was never the problem.
+    """
+    paths, conn = home
+    code = (
+        "from runlace_types import Ctx, Output\n\n\n"
+        "def run(ctx: Ctx) -> Output:\n"
+        '    result = ctx.pennylane.list_transactions(from_="a", to="b")\n'
+        '    rows = [{"id": t["id"]} for t in result["transactions"]]\n'
+        '    return {"rows": rows}\n'
+    )
+    result = compile_workflow(
+        conn, paths.types, name="probe", code=code, inputs_schema=None,
+        outputs_schema=ROWS_SCHEMA,
+    )
+    assert not result.ok
+    assert "inside the `return`" in result.errors[0].hint
+
+
+def test_the_same_list_built_inside_the_return_compiles(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """Which is what makes the hint above worth giving."""
+    paths, conn = home
+    code = (
+        "from runlace_types import Ctx, Output\n\n\n"
+        "def run(ctx: Ctx) -> Output:\n"
+        '    result = ctx.pennylane.list_transactions(from_="a", to="b")\n'
+        '    return {"rows": [{"id": t["id"]} for t in result["transactions"]]}\n'
+    )
+    result = compile_workflow(
+        conn, paths.types, name="probe", code=code, inputs_schema=None,
+        outputs_schema=ROWS_SCHEMA,
+    )
+    assert result.ok, [str(e) for e in result.errors]
+
+
 def test_a_return_value_matching_outputs_schema_compiles(
     home: tuple[RunlacePaths, Connection]
 ) -> None:

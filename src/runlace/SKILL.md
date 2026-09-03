@@ -70,6 +70,10 @@ def run(ctx: Ctx) -> dict[str, object]:
 - Annotate the return type. Use `-> Output` when you declare an
   `outputs_schema` (`Output` is generated from that schema, so pyright checks
   what you return against it); use `-> dict[str, object]` when you do not.
+- When `outputs_schema` has an array of objects, build that list *inside* the
+  `return` statement. Assembled in a variable first it is inferred as a plain
+  `list[dict[...]]`, which pyright will not accept as a list of the generated
+  item type — lists are invariant. Example 3 below does it the working way.
 - `ctx.inputs` is subscripted with the raw JSON key from your `inputs_schema`:
   `ctx.inputs["from"]`, not `ctx.inputs.from_`. It is a real dict, so
   `ctx.inputs.get("branch", "main")` works for an optional input.
@@ -253,7 +257,17 @@ return value at compile time and Pydantic validates it again after the run.
     "type": "object",
     "properties": {
       "count": {"type": "integer"},
-      "flagged": {"type": "integer"},
+      "flagged": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {"type": "string"},
+            "amount": {"type": "number"}
+          },
+          "required": ["id", "amount"]
+        }
+      },
       "notified": {"type": "boolean"}
     },
     "required": ["count", "flagged", "notified"]
@@ -283,7 +297,9 @@ def run(ctx: Ctx) -> Output:
 
     return {
         "count": len(transactions),
-        "flagged": len(flagged),
+        # Built here, not in a variable above: `outputs_schema` gives each item
+        # its expected type, which a `list[dict[...]]` inferred elsewhere loses.
+        "flagged": [{"id": t["id"], "amount": t["amount"]} for t in flagged],
         "notified": bool(flagged),
     }
 ```

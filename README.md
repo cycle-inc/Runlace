@@ -366,3 +366,10 @@ And these in M4:
   classified `read_only`. Runlace does not proxy that call: a `call_tool` on
   this server would be a way around the gate it exists to enforce, and the agent
   already has its own client.
+- **One typecheck hint says the schema is fine.** A list of objects assembled in
+  a variable is inferred as `list[dict[...]]`, which is not a list of the
+  generated item type, because lists are invariant. The value and the
+  `outputs_schema` agree; only where the list was built is wrong. The generic
+  "fix one or the other" would send an agent rewriting a schema that was never
+  the problem, so that case gets its own hint — build the list inside the
+  `return`, where the declared type gives each item its expected shape.
