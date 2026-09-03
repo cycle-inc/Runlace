@@ -31,6 +31,9 @@ services:
       # Off by default upstream. `runlace import --from-open-webui` reads the
       # tool-server list through the API, and an API key is the right credential
       # for that -- a session JWT works too but expires under you.
+      # Only takes effect on a fresh volume: Open WebUI persists this setting on
+      # first boot and the stored value wins. On an existing install, turn it on
+      # in Admin Settings -> General instead.
       - ENABLE_API_KEYS=true
     extra_hosts:
       # How the container reaches `runlace serve` on the host. Explicit because
