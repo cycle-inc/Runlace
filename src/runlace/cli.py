@@ -1,22 +1,36 @@
 """The ``runlace`` command line.
 
-Three commands: ``init`` sets a home up, ``serve`` exposes it to an MCP host,
-``sync`` re-discovers and reports what that cost you.
+``init`` sets a home up, ``serve`` exposes it to an MCP host, ``sync``
+re-discovers and reports what that cost you. ``add``, ``remove`` and ``import``
+change the connector list afterwards, one server at a time, without the
+wholesale replacement ``init`` does.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from .config import default_config_sources
-from .init_cmd import format_table, run_init
-from .paths import paths as runlace_paths
+from .config import Connector, default_config_sources, load_env_file
+from .connect_cmd import (
+    LiteralSecret,
+    add_connectors,
+    build_connector,
+    fetch_open_webui,
+    parse_open_webui,
+    remove_connector,
+    unresolved_references,
+)
+from .init_cmd import InitReport, format_table, run_init
+from .paths import RunlacePaths, paths as runlace_paths
 from .server import serve as serve_server
 from .sync_cmd import format_broken, format_changes, run_sync
 from .typecheck import check_stubs
+
+OPEN_WEBUI_TOKEN_ENV = "OPEN_WEBUI_TOKEN"
 
 app = typer.Typer(
     add_completion=False,
@@ -77,6 +91,139 @@ def init(
         typer.echo(result.report())
         if not result.ok:
             raise typer.Exit(code=1)
+
+
+@app.command()
+def add(
+    name: Annotated[str, typer.Argument(help="What to call it: ctx.<name> in a workflow.")],
+    command: Annotated[
+        str | None,
+        typer.Option("--command", help="Binary to launch for a stdio server, e.g. npx."),
+    ] = None,
+    arg: Annotated[
+        list[str] | None,
+        typer.Option("--arg", help="One argument for --command. Repeatable, in order."),
+    ] = None,
+    env: Annotated[
+        list[str] | None,
+        typer.Option("--env", help="KEY=VALUE for a stdio server. Repeatable."),
+    ] = None,
+    url: Annotated[
+        str | None, typer.Option("--url", help="Endpoint of a remote MCP server.")
+    ] = None,
+    header: Annotated[
+        list[str] | None,
+        typer.Option("--header", help="'Name: value' for --url. Repeatable."),
+    ] = None,
+    transport: Annotated[
+        str, typer.Option("--transport", help="http or sse, for --url.")
+    ] = "http",
+    timeout: Annotated[
+        float, typer.Option(help="Seconds to wait for each server to answer tools/list.")
+    ] = 30.0,
+) -> None:
+    """Add one MCP server to ~/.runlace, keeping the ones already there."""
+    paths = _existing_home()
+    try:
+        connector = build_connector(
+            name,
+            command=command,
+            args=list(arg or []),
+            env=_pairs(env, "--env", "="),
+            url=url,
+            headers=_pairs(header, "--header", ":"),
+            transport="sse" if transport == "sse" else "http",
+        )
+    except LiteralSecret as exc:
+        typer.secho(f"{name}: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    _apply([connector], paths, timeout=timeout)
+
+
+@app.command("import")
+def import_(
+    from_open_webui: Annotated[
+        str,
+        typer.Option(
+            "--from-open-webui",
+            help="Base URL of an Open WebUI instance, e.g. http://localhost:3000.",
+        ),
+    ],
+    token_env: Annotated[
+        str,
+        typer.Option(
+            "--token-env",
+            help="Environment variable holding an Open WebUI ADMIN token.",
+        ),
+    ] = OPEN_WEBUI_TOKEN_ENV,
+    timeout: Annotated[
+        float, typer.Option(help="Seconds to wait for each server to answer tools/list.")
+    ] = 30.0,
+) -> None:
+    """Copy a chat UI's MCP servers into ~/.runlace.
+
+    The UI keeps the credentials; this writes a ${VAR} reference beside each one
+    and tells you what to export. Runlace itself is skipped, and so is anything
+    the UI serves over OpenAPI rather than MCP.
+    """
+    paths = _existing_home()
+    token = os.environ.get(token_env, "")
+    if not token:
+        typer.secho(
+            f"${token_env} is not set. In Open WebUI: your avatar -> Settings -> "
+            f"Account -> API keys, then export it. It needs to be an admin token.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        payload = fetch_open_webui(from_open_webui, token)
+    except Exception as exc:  # network, auth, HTML instead of JSON
+        typer.secho(f"{from_open_webui}: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    imported = parse_open_webui(payload)
+    for warning in imported.warnings:
+        typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW)
+    for name in imported.skipped:
+        typer.echo(f"skip     {name} (that's me)")
+    if not imported.connectors:
+        typer.secho("Nothing to import.", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+
+    _apply(imported.connectors, paths, timeout=timeout)
+    typer.echo("")
+    typer.echo(
+        "These are now driven through Runlace. Disable them in Open WebUI unless "
+        "you want the model calling them directly, without the confirm gate."
+    )
+
+
+@app.command()
+def remove(
+    name: Annotated[str, typer.Argument(help="Connector to drop.")],
+    timeout: Annotated[
+        float, typer.Option(help="Seconds to wait for each server to answer tools/list.")
+    ] = 30.0,
+) -> None:
+    """Drop one MCP server from ~/.runlace.
+
+    Stored workflows that used it stay readable. Their next run is refused
+    rather than half-executed.
+    """
+    paths = _existing_home()
+    result, report = remove_connector(paths, name, timeout=timeout)
+    if report is None:
+        for warning in result.warnings:
+            typer.secho(warning, fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"-        {name}")
+    _print_report(report)
 
 
 @app.command()
@@ -157,9 +304,19 @@ def serve(
             help="Interface to bind --http to. Use 0.0.0.0 to let a container reach it.",
         ),
     ] = "127.0.0.1",
+    env_file: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--env-file",
+            help="File of KEY=VALUE lines holding the tokens your connectors "
+            "reference. Repeatable. Values are never printed.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Start the Runlace MCP server so any MCP host can add it."""
     paths = runlace_paths()
+    _load_env_files(env_file)
     if not paths.db.exists():
         typer.secho(
             f"No Runlace home at {paths.home}. Run `runlace init` first.",
@@ -177,6 +334,90 @@ def serve(
         )
     # stdio is the transport: anything printed to stdout would corrupt it.
     serve_server(paths, port=http, host=host)
+
+
+def _existing_home() -> RunlacePaths:
+    """The Runlace home, or a clear error. Every command below needs one."""
+    paths = runlace_paths()
+    if not paths.config.exists():
+        typer.secho(
+            f"No Runlace home at {paths.home}. Run `runlace init` first.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    return paths
+
+
+def _load_env_files(paths: list[Path] | None) -> None:
+    """Load each --env-file, reporting names only. Never the values."""
+    for path in paths or []:
+        if not path.exists():
+            typer.secho(f"{path}: not found", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        names = load_env_file(path)
+        typer.secho(
+            f"{path}: loaded {', '.join(names) if names else 'nothing new'}",
+            fg=typer.colors.BRIGHT_BLACK,
+            err=True,
+        )
+
+
+def _pairs(values: list[str] | None, flag: str, sep: str) -> dict[str, str]:
+    """Parse repeated ``KEY<sep>VALUE`` options. Only the first separator splits."""
+    parsed: dict[str, str] = {}
+    for raw in values or []:
+        key, found, value = raw.partition(sep)
+        if not found or not key.strip():
+            typer.secho(
+                f"{flag} expects KEY{sep}VALUE, got `{raw}`",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        parsed[key.strip()] = value.strip()
+    return parsed
+
+
+def _apply(incoming: list[Connector], paths: RunlacePaths, *, timeout: float) -> None:
+    """Merge, re-discover, and print what happened. Shared by add and import."""
+    merged, report = add_connectors(paths, incoming, timeout=timeout)
+    for warning in merged.warnings:
+        typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW)
+    for name in merged.added:
+        typer.echo(f"+        {name}")
+    for name in merged.replaced:
+        typer.echo(f"~        {name} (replaced)")
+    if not merged.changed:
+        typer.secho("Nothing added.", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+    for name, variables in unresolved_references(merged.connectors).items():
+        typer.secho(
+            f"warning: {name} needs {', '.join(variables)}, not set right now",
+            fg=typer.colors.YELLOW,
+        )
+    _print_report(report)
+
+
+def _print_report(report: InitReport) -> None:
+    typer.echo("")
+    typer.echo(format_table(report.rows) if report.rows else "No MCP servers left.")
+    typer.echo("")
+    typer.echo(
+        f"{len(report.connected)} connector(s) connected, {report.tool_count} tool(s)"
+    )
+    for warning in report.warnings:
+        typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW)
+
+    failed = [r for r in report.rows if r.status != "connected"]
+    if failed:
+        typer.secho(
+            f"{len(failed)} connector(s) did not answer: "
+            f"{', '.join(r.name for r in failed)}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
 
 def _prompt_for_sources(*, assume_yes: bool) -> list[Path]:

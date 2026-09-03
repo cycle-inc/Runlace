@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from runlace.config import (
     ImportResult,
     MissingEnvVars,
     import_from_files,
+    load_env_file,
     read_config,
     write_config,
 )
@@ -175,3 +177,42 @@ def test_a_bare_dollar_name_is_not_a_reference() -> None:
 def test_a_connector_without_references_is_unchanged() -> None:
     connector = http_connector(headers={"Authorization": "Bearer literal"})
     assert connector.resolved({}) == connector
+
+
+# -- --env-file ---
+
+
+def test_an_env_file_puts_its_names_in_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why this exists: `runlace serve` resolves ${VAR} from its own
+    environment, not from the shell where you ran `runlace add`."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    path = tmp_path / ".env"
+    path.write_text("# a comment\n\nexport GITHUB_TOKEN=\"ghp_x\"\nNOTION_KEY=secret\n")
+
+    assert sorted(load_env_file(path)) == ["GITHUB_TOKEN", "NOTION_KEY"]
+    assert os.environ["GITHUB_TOKEN"] == "ghp_x"
+    assert os.environ["NOTION_KEY"] == "secret"
+
+
+def test_the_environment_wins_over_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file is a fallback. Overriding what you just exported would be rude."""
+    monkeypatch.setenv("GITHUB_TOKEN", "from-the-shell")
+    path = tmp_path / ".env"
+    path.write_text("GITHUB_TOKEN=from-the-file\n")
+
+    assert load_env_file(path) == []
+    assert os.environ["GITHUB_TOKEN"] == "from-the-shell"
+
+
+def test_a_line_that_is_not_an_assignment_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OK", raising=False)
+    path = tmp_path / ".env"
+    path.write_text("just some words\nnot-an-identifier=1\nOK=1\n")
+
+    assert load_env_file(path) == ["OK"]

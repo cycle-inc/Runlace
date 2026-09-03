@@ -242,6 +242,31 @@ def import_from_files(sources: list[Path]) -> ImportResult:
     return ImportResult(connectors=connectors, warnings=warnings)
 
 
+def load_env_file(path: Path) -> list[str]:
+    """Put ``KEY=VALUE`` lines into the environment. Returns the names it set.
+
+    A ``${VAR}`` in config.json is resolved from the environment of whatever
+    process opens the connection -- which is ``runlace serve``, not the shell
+    where you ran ``runlace add``. Without this you export a token, add a
+    connector, and then watch every run fail in a terminal you started earlier.
+
+    Only names, never values, come back out of here. Anything already set in
+    the environment wins: the file is a fallback, not an override.
+    """
+    loaded: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip().removeprefix("export ").strip()
+        if not line or line.startswith("#"):
+            continue
+        name, found, value = line.partition("=")
+        name = name.strip()
+        if not found or not name.isidentifier() or name in os.environ:
+            continue
+        os.environ[name] = value.strip().strip("\"'")
+        loaded.append(name)
+    return loaded
+
+
 def write_config(path: Path, connectors: list[Connector]) -> None:
     doc = {
         "version": CONFIG_VERSION,

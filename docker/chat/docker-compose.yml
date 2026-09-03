@@ -28,6 +28,10 @@ services:
       - OPENAI_API_KEY=${MISTRAL_API_KEY:?run ./scripts/chat_ui.sh rather than compose directly}
       # Nothing local to talk to, and leaving it on costs a slow probe per page.
       - ENABLE_OLLAMA_API=false
+      # Off by default upstream. `runlace import --from-open-webui` reads the
+      # tool-server list through the API, and an API key is the right credential
+      # for that -- a session JWT works too but expires under you.
+      - ENABLE_API_KEYS=true
     extra_hosts:
       # How the container reaches `runlace serve` on the host. Explicit because
       # host-gateway is not wired up by default outside Docker Desktop.

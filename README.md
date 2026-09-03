@@ -341,6 +341,87 @@ version that was edited stays on disk, readable and runnable.
 dry run that finds it on real data without toggling anything, a one-string fix,
 a second dry run that passes, then refused-without-confirm and completed-with-it.
 
+## Adding MCP servers after the first run
+
+`init` imports a list of configs and writes exactly that list. That is right the
+first time and wrong every time after, so three commands merge instead.
+
+```
+runlace add files --command npx \
+  --arg -y --arg @modelcontextprotocol/server-filesystem --arg ~/sandbox
+
+runlace add github --url https://api.githubcopilot.com/mcp/ \
+  --header 'Authorization: Bearer ${GITHUB_TOKEN}'
+
+runlace remove files
+```
+
+**A credential written literally is refused.** `config.json` is a file on disk;
+`${VAR}` is resolved when the connection opens, so the file keeps the reference
+and never the secret. Runlace tells you which variable to use:
+
+```
+$ runlace add github --url ... --header "Authorization: Bearer ghp_realtoken"
+github: header `Authorization` looks like a credential, and config.json is a
+file on disk. Use "${RUNLACE_GITHUB_AUTHORIZATION}" instead and export it
+before the next run.
+```
+
+That variable is read by whichever process opens the connection, which is
+`runlace serve` — not the shell where you ran `runlace add`. `--env-file` is
+there so the two do not drift apart:
+
+```
+runlace serve --http 8000 --env-file ~/.runlace/tokens.env
+```
+
+It reports the names it loaded and never the values, and anything already in the
+environment wins.
+
+### `runlace import --from-open-webui`
+
+If your users connect their MCP servers in the chat UI, this copies them across:
+
+```
+export OPEN_WEBUI_TOKEN=sk-...        # an Open WebUI admin API key
+runlace import --from-open-webui http://localhost:3000
+```
+
+```
+warning: github: uses bearer auth, and the token stays in Open WebUI --
+         ${RUNLACE_GITHUB_AUTHORIZATION} stands in for it
+warning: https://weather.example/openapi: type `openapi`, not an MCP server -- skipped
+skip     runlace (that's me)
+~        github (replaced)
+
+SERVER      TRANSPORT  TOOLS  STATUS
+----------  ---------  -----  ---------
+everything  stdio      13     connected
+files       stdio      14     connected
+github      http       47     connected
+```
+
+The bridge only runs this way, and that is not a limitation of the code. Open
+WebUI's `ToolServerConnection` has a `url` and no `command`: it can only reach
+MCP servers over HTTP, and cannot launch `npx`. Runlace speaks stdio *and* HTTP,
+so everything the UI knows about, Runlace can drive — never the reverse.
+
+Four things it does on purpose:
+
+- **Runlace skips itself.** It is registered in the UI too, and importing it
+  would be a loop.
+- **OpenAPI tool servers are refused.** Runlace drives MCP; writing a connector
+  that can never connect is worse than saying so.
+- **Credentials do not come across.** The UI keeps the real token; Runlace gets
+  a `${VAR}` beside it. Re-importing will not clobber a reference you already
+  set and exported — anything you typed wins over anything we generated.
+- **A variable nobody exported is named before discovery runs**, because "did
+  not answer" is a much worse explanation than "export `GITHUB_TOKEN`".
+
+Once imported, disable the server in Open WebUI. It stays in the config, so the
+bridge can still read it, but the model can no longer call it directly — it has
+to go through Runlace, with the confirm gate and the journal.
+
 ## A chat UI to drive it with
 
 `docker/chat/` brings up [Open WebUI](https://github.com/open-webui/open-webui)
