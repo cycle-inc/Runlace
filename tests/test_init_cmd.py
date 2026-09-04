@@ -9,6 +9,7 @@ from typing import Any
 from runlace.config import Connector
 from runlace.discovery import DiscoveredTool, DiscoveryResult
 from runlace.init_cmd import ConnectorRow, format_table, plan_connector, run_init
+from runlace.model import Model, write_model
 from runlace.paths import RunlacePaths
 from runlace.policy import Policy
 
@@ -130,6 +131,33 @@ def test_init_reports_a_policy_override_that_names_nothing(paths: RunlacePaths) 
     report = run_init(paths, [FIXTURES / "claude_config.json"], timeout=1.0)
 
     assert any("risk.ghub.search matches no known tool" in w for w in report.warnings)
+
+
+def test_an_override_for_the_configured_model_is_not_a_typo(
+    paths: RunlacePaths,
+) -> None:
+    """`ctx.ai` is overridable per model, and no server hosts a tool by that name."""
+    paths.create()
+    write_model(paths.model, Model(base_url="https://api.openai.com/v1", model="gpt-4o-mini"))
+    paths.policy.write_text(
+        "risk:\n  ai:\n    gpt-4o-mini: read_only\n", encoding="utf-8"
+    )
+
+    report = run_init(paths, [FIXTURES / "claude_config.json"], timeout=1.0)
+
+    assert not any("risk.ai" in w for w in report.warnings)
+
+
+def test_an_override_for_a_model_this_machine_does_not_use_is_reported(
+    paths: RunlacePaths,
+) -> None:
+    paths.create()
+    write_model(paths.model, Model(base_url="https://api.openai.com/v1", model="gpt-4o-mini"))
+    paths.policy.write_text("risk:\n  ai:\n    gpt-5: read_only\n", encoding="utf-8")
+
+    report = run_init(paths, [FIXTURES / "claude_config.json"], timeout=1.0)
+
+    assert any("risk.ai.gpt-5 matches no known tool" in w for w in report.warnings)
 
 
 def test_format_table_aligns_and_includes_status() -> None:

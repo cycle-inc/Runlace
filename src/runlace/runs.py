@@ -49,7 +49,8 @@ from .journal import get_run as read_run
 from .model import Model, read_model
 from .paths import RunlacePaths
 from .policy import Policy, read_policy
-from .risk import READ_ONLY, SIDE_EFFECT
+from .risk import READ_ONLY, SIDE_EFFECT, Risk
+from .runner_shim import AI_CONNECTOR, AI_TOOL
 from .queue import (
     APPROVAL_ASK,
     AWAITING_APPROVAL,
@@ -254,7 +255,9 @@ def admit(
     # Worked out before the run row is written so that what the gates decided is
     # stored with the run rather than recomputed later against a policy file
     # somebody edited in between.
-    side_effects = side_effects_of(read_policy(paths.policy), record)
+    side_effects = side_effects_of(
+        read_policy(paths.policy), record, read_model(paths.model)
+    )
 
     run_id = f"run_{uuid.uuid4().hex[:12]}"
     insert_run(
@@ -386,8 +389,19 @@ async def execute(
         )
         conn.commit()
 
-    stand_ins = _stand_ins(conn, simulated) if dry_run else {}
-    ai = _ai_bridge(paths, ask)
+    # `ai.complete` is in `simulated` when the gates called the model a side
+    # effect, but it is not a tool and has no stand-in to look up in the
+    # database: the bridge invents its answer from the schema instead.
+    ai_acts = {"connector": AI_CONNECTOR, "tool": AI_TOOL} in admitted.side_effects
+    stand_ins = _stand_ins(
+        conn, [t for t in simulated if t["connector"] != AI_CONNECTOR]
+    )
+    ai = _ai_bridge(
+        paths,
+        ask,
+        risk=SIDE_EFFECT if ai_acts else READ_ONLY,
+        simulate=dry_run and ai_acts,
+    )
 
     if call_tool is not None:
         outcome = await run_code(
@@ -615,7 +629,13 @@ def _unfinished(conn: Connection, admitted: Admitted) -> dict[str, Any]:
     }
 
 
-def _ai_bridge(paths: RunlacePaths, ask: Ask | None) -> AiBridge | None:
+def _ai_bridge(
+    paths: RunlacePaths,
+    ask: Ask | None,
+    *,
+    risk: Risk = READ_ONLY,
+    simulate: bool = False,
+) -> AiBridge | None:
     """What `ctx.ai(...)` reaches during this run, if anything.
 
     ``None`` when no model is configured -- `create_workflow` refuses a
@@ -623,15 +643,30 @@ def _ai_bridge(paths: RunlacePaths, ask: Ask | None) -> AiBridge | None:
     model was removed afterwards, and the step says so rather than the run
     failing somewhere less obvious.
 
-    ``ask`` is injectable for the same reason ``call_tool`` is; a fake model is
-    treated as local, because a fake sends nothing anywhere.
+    ``simulate`` is the dry run: the question is never asked, and the answer is
+    invented from the schema the call gave. It applies only to a model the
+    gates called a side effect, because a model on this machine has nothing to
+    simulate -- asking it for real is what makes a dry run worth running.
+
+    ``ask`` is injectable for the same reason ``call_tool`` is.
     """
-    model = read_model(paths.model)
+    if simulate:
+        return AiBridge(ask=_inventing, risk=risk)
     if ask is None:
+        model = read_model(paths.model)
         if model is None:
             return None
         ask = _asking(model)
-    return AiBridge(ask=ask, risk=ai_risk(model))
+    return AiBridge(ask=ask, risk=risk)
+
+
+async def _inventing(system: str, user: str, schema: dict[str, Any] | None) -> Answer:
+    """The dry run's answer: the shape that was asked for, filled in.
+
+    No tokens, because none were spent -- and a reader of the journal can tell a
+    simulated step from a real one by exactly that.
+    """
+    return Answer(stand_in(schema if schema else {"type": "string"}))
 
 
 def _asking(model: Model) -> Ask:
@@ -650,7 +685,7 @@ def _asking(model: Model) -> Ask:
     return ask
 
 
-def ai_risk(model: Model | None) -> str:
+def ai_risk(model: Model | None) -> Risk:
     """How risky it is to reach this model. Distance decides.
 
     A model on this machine has sent nothing anywhere, so an AI step against it
@@ -660,8 +695,10 @@ def ai_risk(model: Model | None) -> str:
     return READ_ONLY if model is None or model.is_local else SIDE_EFFECT
 
 
-def side_effects_of(policy: Policy, record: dict[str, Any]) -> list[dict[str, Any]]:
-    """The tools in this workflow that act on the world, under today's policy.
+def side_effects_of(
+    policy: Policy, record: dict[str, Any], model: Model | None = None
+) -> list[dict[str, Any]]:
+    """What in this workflow acts on the world, under today's policy.
 
     The risk pinned on the version is what the tool was when the workflow was
     compiled. `policy.yaml` may have been edited since, and an edit that marks a
@@ -669,12 +706,38 @@ def side_effects_of(policy: Policy, record: dict[str, Any]) -> list[dict[str, An
     override protects nothing you already built. It only ever tightens: relaxing
     a pinned `side_effect` would need a new version, which is the safe direction
     to require paperwork in.
+
+    An AI step is the exception to the pinning: nothing about the model is
+    stored on the version, because the model is a property of the machine and
+    can be changed between two runs of the same workflow. Its risk is worked out
+    from whatever is configured *now*.
     """
-    return [
+    acting = [
         {"connector": str(t["connector"]), "tool": str(t["tool"])}
         for t in record["tools_used"]
         if _effective_risk(policy, t) != "read_only"
     ]
+    if record.get("uses_ai") and _ai_risk_under(policy, model) != READ_ONLY:
+        acting.append({"connector": AI_CONNECTOR, "tool": AI_TOOL})
+    return acting
+
+
+def _ai_risk_under(policy: Policy, model: Model | None) -> str:
+    """`ai_risk`, with the machine's own opinion on this particular model.
+
+    Overridable in both directions, unlike a tool's pinned risk: "I trust this
+    provider with this data" and "even a local model is not allowed to see this"
+    are both sentences a user gets to say, and the model name is the key --
+
+    .. code-block:: yaml
+
+        risk:
+          ai:
+            gpt-4o-mini: read_only
+    """
+    return policy.risk_for(
+        AI_CONNECTOR, model.model if model else "", ai_risk(model)
+    )
 
 
 def _fail(

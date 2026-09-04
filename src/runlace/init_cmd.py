@@ -14,10 +14,12 @@ from . import db, stubs
 from .config import Connector, import_from_files, write_config
 from .discovery import DEFAULT_TIMEOUT_SECONDS, DiscoveredTool, DiscoveryResult, discover_all
 from .hashing import schema_hash
+from .model import read_model
 from .naming import python_identifier
 from .paths import RunlacePaths
 from .policy import EMPTY, Policy, read_policy, unknown_targets
 from .risk import classify
+from .runner_shim import AI_CONNECTOR
 
 
 @dataclass
@@ -188,6 +190,11 @@ def discover_and_persist(
                     else f"{result.status} ({result.detail})",
                 )
             )
+        # `ctx.ai` is overridable per model, and the model is not a tool on
+        # any server, so it has to be added by hand or it reads as a typo.
+        model = read_model(paths.model)
+        if model is not None:
+            seen.add((AI_CONNECTOR, model.model))
         # A typo here fails silently and in the dangerous direction: you believe
         # a tool is gated and it is not.
         report.warnings.extend(unknown_targets(policy, seen))

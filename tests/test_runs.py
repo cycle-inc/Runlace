@@ -846,15 +846,145 @@ def test_with_no_model_configured_there_is_no_bridge(paths: RunlacePaths) -> Non
     assert _ai_bridge(paths, None) is None
 
 
-def test_the_configured_model_is_what_the_bridge_reaches(paths: RunlacePaths) -> None:
+def test_the_bridge_carries_the_risk_the_gates_decided(paths: RunlacePaths) -> None:
+    """Not recomputed here: what the run was admitted under is what it is journaled as."""
     configure_model(paths, base_url="https://openrouter.ai/api/v1")
-    bridge = _ai_bridge(paths, None)
+    bridge = _ai_bridge(paths, None, risk="side_effect")
     assert bridge is not None
     assert bridge.risk == "side_effect"
 
 
-def test_an_injected_model_is_treated_as_local(paths: RunlacePaths) -> None:
-    """A fake sends nothing anywhere, so a test does not have to confirm a run."""
-    bridge = _ai_bridge(paths, canned)
+def test_a_simulated_bridge_invents_the_shape_and_spends_nothing(
+    paths: RunlacePaths,
+) -> None:
+    bridge = _ai_bridge(paths, None, risk="side_effect", simulate=True)
     assert bridge is not None
-    assert bridge.risk == "read_only"
+    schema = {
+        "type": "object",
+        "properties": {"healthy": {"type": "boolean"}, "why": {"type": "string"}},
+    }
+    async def invent() -> Answer:
+        return await bridge.ask("s", "u", schema)
+
+    invented = asyncio.run(invent())
+    assert set(invented.value) == {"healthy", "why"}
+    assert (invented.tokens_in, invented.tokens_out) == (None, None)
+
+
+def test_a_simulated_bridge_without_a_schema_still_answers_a_string(
+    paths: RunlacePaths,
+) -> None:
+    bridge = _ai_bridge(paths, None, risk="side_effect", simulate=True)
+    assert bridge is not None
+    async def invent() -> Answer:
+        return await bridge.ask("s", "u", None)
+
+    assert isinstance(asyncio.run(invent()).value, str)
+
+
+# -- the gates, when the model is somewhere else ---------------------------
+
+REMOTE = "https://api.openai.com/v1"
+
+
+def test_a_remote_model_makes_the_run_need_confirmation(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The run's data leaves the machine. That is a side effect like sending mail."""
+    paths, _ = home
+    configure_model(paths, base_url=REMOTE)
+    store(home, AI_WORKFLOW, name="verdict")
+
+    result = execute(home, workflow="verdict", ask=canned)
+    assert result["ok"] is False
+    assert result["code"] == CODE_NEEDS_CONFIRMATION
+    assert {"connector": "ai", "tool": "complete"} in result["side_effects"]
+
+
+def test_the_same_run_goes_through_with_confirm(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, conn = home
+    configure_model(paths, base_url=REMOTE)
+    store(home, AI_WORKFLOW, name="verdict")
+
+    result = execute(home, workflow="verdict", confirm=True, ask=canned)
+    assert result["ok"] is True, result
+    assert get_step(conn, result["run_id"], 2)["risk"] == "side_effect"
+
+
+def test_a_local_model_needs_no_confirmation(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, _ = home
+    configure_model(paths)
+    store(home, AI_WORKFLOW, name="verdict")
+    assert execute(home, workflow="verdict", ask=canned)["ok"] is True
+
+
+def test_policy_can_vouch_for_a_provider(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """Keyed by model name: "I trust this one with this data" is the user's to say."""
+    paths, _ = home
+    configure_model(paths, base_url=REMOTE)
+    paths.policy.write_text("risk:\n  ai:\n    qwen3:8b: read_only\n", encoding="utf-8")
+    store(home, AI_WORKFLOW, name="verdict")
+    assert execute(home, workflow="verdict", ask=canned)["ok"] is True
+
+
+def test_policy_can_gate_a_model_on_this_machine(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """And the other direction: not even a local model gets to see this."""
+    paths, _ = home
+    configure_model(paths)
+    paths.policy.write_text(
+        "risk:\n  ai:\n    qwen3:8b: side_effect\n", encoding="utf-8"
+    )
+    store(home, AI_WORKFLOW, name="verdict")
+    assert execute(home, workflow="verdict", ask=canned)["code"] == CODE_NEEDS_CONFIRMATION
+
+
+def test_a_dry_run_invents_the_remote_answer_and_asks_nothing(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, conn = home
+    configure_model(paths, base_url=REMOTE)
+    store(home, AI_WORKFLOW, name="verdict")
+
+    asked: list[str] = []
+
+    async def counted(system: str, user: str, schema: dict[str, Any] | None) -> Answer:
+        asked.append(user)
+        return Answer({"healthy": True})
+
+    result = execute(home, workflow="verdict", dry_run=True, ask=counted)
+    assert result["ok"] is True, result
+    assert asked == []
+    assert {"connector": "ai", "tool": "complete"} in result["simulated"]
+    # The shape the workflow asked for, filled in: `healthy` is a boolean.
+    assert result["output"] == {"healthy": False}
+    assert "tokens" not in get_step(conn, result["run_id"], 2)
+
+
+def test_a_dry_run_really_asks_a_model_on_this_machine(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """Nothing left the machine, so there is nothing to simulate -- and a dry run
+    that skipped the judgement would not be testing the workflow at all."""
+    paths, _ = home
+    configure_model(paths)
+    store(home, AI_WORKFLOW, name="verdict")
+
+    asked: list[str] = []
+
+    async def counted(system: str, user: str, schema: dict[str, Any] | None) -> Answer:
+        asked.append(user)
+        return Answer({"healthy": True})
+
+    result = execute(home, workflow="verdict", dry_run=True, ask=counted)
+    assert result["ok"] is True, result
+    assert len(asked) == 1
+    assert result["simulated"] == []
+    assert result["output"] == {"healthy": True}
