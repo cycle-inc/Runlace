@@ -12,6 +12,9 @@ saying what was dropped and from where. That is deliberate and there is no flag
 to turn it off: the point is to show an agent the *shape* of what a tool
 returned, so it can write code against it. If it needs all thousand rows, the
 workflow is the thing that should be reading them.
+
+The arguments are treated differently, and the difference is on purpose -- see
+``PAYLOAD_BUDGET``.
 """
 
 from __future__ import annotations
@@ -31,6 +34,13 @@ CODE_UNKNOWN_STEP = "unknown-step"
 MAX_ITEMS = 2
 MAX_STRING = 300
 
+# The arguments are the workflow's own, not foreign data of unknown size, and
+# an agent debugging a call needs to see exactly what it sent -- trimming
+# `fields=["name", "path", "repository"]` down to two hides the answer. So they
+# come back verbatim until they are big enough to be the problem themselves: a
+# 50 KB `body=`, a bulk create with five hundred items.
+PAYLOAD_BUDGET = 2000
+
 
 def get_step(conn: Connection, run_id: str, seq: int) -> dict[str, Any]:
     """One journaled tool call, arguments and result included, trimmed."""
@@ -39,7 +49,9 @@ def get_step(conn: Connection, run_id: str, seq: int) -> dict[str, Any]:
         return _no_step(conn, run_id, seq)
 
     notes: list[str] = []
-    payload = _trim(_decode(row["payload_json"]), "payload", notes)
+    payload = _decode(row["payload_json"])
+    if len(row["payload_json"] or "") > PAYLOAD_BUDGET:
+        payload = _trim(payload, "payload", notes)
     result = _trim(_decode(row["result_json"]), "result", notes)
 
     return {

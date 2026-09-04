@@ -19,11 +19,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from typing import Any
 
 import httpx2
+from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from _mcp import call
@@ -51,14 +53,24 @@ yourself, do not wrap the JSON in a code fence.
 JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
 
 
-def prompt_for(skill: dict[str, Any], task: str) -> str:
-    """SKILL.md, the live connector index, the stubs, and the job."""
+def prompt_for(server: MCPServer, skill: dict[str, Any], task: str) -> str:
+    """SKILL.md, the live connector index, the signatures, and the job.
+
+    The server splits these in two -- ``get_skill`` for the index, ``get_tools``
+    for the signatures of the few tools an agent picked. This harness is a
+    single prompt to a model that is not calling tools, so it asks for all of
+    them and pastes them in. That is the expensive spelling on purpose: it is
+    also the one that measures what a small model can hold.
+    """
     index = "\n".join(
         f"{tool['risk']:<12}{tool['call']}\n    {tool['description'] or ''}"
         for connector in skill["connectors"]
         for tool in connector["tools"]
     )
-    stubs = "\n\n".join(f"# {name}\n{body}" for name, body in skill["stubs"].items())
+    stubs = "\n\n".join(
+        f"# {connector['connector']}\n{call(server, 'get_tools', connector=connector['connector'])['types']}"
+        for connector in skill["connectors"]
+    )
     return (
         f"{skill['skill']}\n\n"
         f"# Your connectors\n\n{index}\n\n"
@@ -67,9 +79,20 @@ def prompt_for(skill: dict[str, Any], task: str) -> str:
     )
 
 
-def ask(base_url: str, model: str, messages: list[dict[str, str]], timeout: float) -> str:
+def ask(
+    base_url: str,
+    model: str,
+    messages: list[dict[str, str]],
+    timeout: float,
+    api_key: str | None = None,
+) -> str:
+    # Ollama needs no key. A hosted endpoint does, and it is read from the
+    # environment rather than passed on the command line: an argument would be
+    # in the shell history and in `ps`.
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     response = httpx2.post(
         f"{base_url.rstrip('/')}/chat/completions",
+        headers=headers,
         json={
             "model": model,
             "messages": messages,
@@ -119,7 +142,16 @@ def main() -> int:
     parser.add_argument("--name", default="demo-agent")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument(
+        "--api-key-env",
+        help="Name of the environment variable holding the endpoint's API key. "
+        "Unset for Ollama. The value is never printed.",
+    )
     args = parser.parse_args()
+    api_key = os.environ.get(args.api_key_env) if args.api_key_env else None
+    if args.api_key_env and not api_key:
+        print(f"${args.api_key_env} is not set", file=sys.stderr)
+        return 2
     # One INFO line per request, in a box, in the middle of the model's code.
     logging.getLogger("httpx2").setLevel(logging.WARNING)
     # A round on a laptop takes minutes. Piped to a file, the default block
@@ -129,17 +161,18 @@ def main() -> int:
 
     server = build_server(runlace_paths())
     skill = call(server, "get_skill")
-    print(f"get_skill: {len(prompt_for(skill, args.task)):,} characters of context")
+    prompt = prompt_for(server, skill, args.task)
+    print(f"context: {len(prompt):,} characters")
 
     messages = [
         {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": prompt_for(skill, args.task)},
+        {"role": "user", "content": prompt},
     ]
 
     for round_number in range(1, args.rounds + 1):
         print(f"\n== round {round_number}: asking {args.model}")
         try:
-            answer = ask(args.base_url, args.model, messages, args.timeout)
+            answer = ask(args.base_url, args.model, messages, args.timeout, api_key)
         except httpx2.HTTPError as error:
             print(f"cannot reach {args.base_url}: {error}", file=sys.stderr)
             return 2

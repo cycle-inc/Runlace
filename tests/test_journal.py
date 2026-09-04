@@ -61,7 +61,7 @@ def conn(paths: RunlacePaths) -> Connection:
         connector="github",
         tool="search_code",
         risk="read_only",
-        payload={"query": "def run("},
+        payload={"query": "def run(", "fields": ["name", "path", "repository"]},
         result={
             "total_count": 50,
             "items": [{"name": f"f{i}.py", "body": "x" * 1000} for i in range(50)],
@@ -105,10 +105,19 @@ def test_the_real_size_is_reported_even_though_it_is_not_returned(
     assert step["result_chars"] > 50_000
 
 
-def test_the_arguments_the_workflow_sent_come_back_too(conn: Connection) -> None:
+def test_the_arguments_the_workflow_sent_come_back_verbatim(conn: Connection) -> None:
+    """Found live: a `fields` list trimmed to two of three hid the answer.
+
+    The arguments are the workflow's own. An agent reading a step is asking
+    what it sent, and a trimmed answer to that question is a wrong one.
+    """
     step = get_step(conn, RUN_ID, 1)
 
-    assert step["payload"] == {"query": "def run("}
+    assert step["payload"] == {
+        "query": "def run(",
+        "fields": ["name", "path", "repository"],
+    }
+    assert not any(n.startswith("payload") for n in step["trimmed"])
     assert (step["connector"], step["tool"], step["status"]) == (
         "github",
         "search_code",
@@ -146,6 +155,41 @@ def test_a_short_result_is_returned_whole(paths: RunlacePaths) -> None:
 
     assert step["result"] == {"echoed": "hi"}
     assert step["trimmed"] == []
+
+
+def test_arguments_big_enough_to_be_the_problem_are_trimmed_after_all(
+    paths: RunlacePaths,
+) -> None:
+    """The exception to the rule above: a bulk create is not a debugging aid."""
+    connection = connect(paths.db)
+    a_workflow_version(connection)
+    insert_run(
+        connection,
+        run_id="run_bulk",
+        workflow_version_id=VERSION_ID,
+        inputs={},
+        confirmed=False,
+    )
+    insert_step(
+        connection,
+        step_id="st_3",
+        run_id="run_bulk",
+        seq=1,
+        connector="files",
+        tool="write",
+        risk="side_effect",
+        payload={"lines": [f"line {i}" for i in range(500)]},
+        result={"written": True},
+        status="ok",
+        duration_ms=5,
+        error=None,
+    )
+    connection.commit()
+
+    step = get_step(connection, "run_bulk", 1)
+
+    assert len(step["payload"]["lines"]) == MAX_ITEMS
+    assert f"payload.lines: kept {MAX_ITEMS} of 500 items" in step["trimmed"]
 
 
 def test_an_unknown_run_is_not_confused_with_an_unknown_step(conn: Connection) -> None:
