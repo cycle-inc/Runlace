@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS runs (
     workflow_version_id TEXT NOT NULL REFERENCES workflow_versions(id) ON DELETE CASCADE,
     inputs_json         TEXT,
     confirmed           INTEGER NOT NULL DEFAULT 0,
-    status              TEXT NOT NULL,       -- running | completed | failed
+    status              TEXT NOT NULL,       -- see runlace.queue; v4 added four more
     output_json         TEXT,
     started_at          TEXT NOT NULL,
     finished_at         TEXT
@@ -110,6 +110,19 @@ MIGRATIONS = [
     # its read-only steps really happened -- but it must never be mistaken for
     # one, because its side effects were stood in for and never left the machine.
     "ALTER TABLE runs ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0",
+    # v4 (M7): the queue. `runs` gains states about the present -- waiting for a
+    # worker, waiting for a human -- on top of the two it had about the past.
+    # There is no second table for the queue: a queued run is durable because it
+    # was never anywhere but here. See `runlace.queue` for the states themselves.
+    #
+    # `queued_at` is when the run became claimable, which is not when it was
+    # created: a run parked for approval is created first and queued later, if a
+    # human says yes. NULL means it is not in line.
+    "ALTER TABLE runs ADD COLUMN queued_at TEXT",
+    "ALTER TABLE runs ADD COLUMN approved_at TEXT",
+    # Why a parked run ended the way it did -- the reason a human gave for
+    # refusing it, or the fact that nobody answered in time.
+    "ALTER TABLE runs ADD COLUMN approval_note TEXT",
 ]
 
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
@@ -373,22 +386,111 @@ def insert_run(
     inputs: Any,
     confirmed: bool,
     dry_run: bool = False,
+    status: str = "running",
+    queued_at: str | None = None,
 ) -> None:
-    """Open a run. Written before anything is attempted, so a crash leaves a trace."""
+    """Open a run. Written before anything is attempted, so a crash leaves a trace.
+
+    ``status`` is ``running`` for a run that starts executing immediately and
+    ``queued`` or ``awaiting_approval`` for one that goes into the queue instead.
+    ``queued_at`` is set for the first of those and left NULL for the second --
+    a parked run is not in line until a human puts it there.
+    """
     conn.execute(
         """
         INSERT INTO runs(id, workflow_version_id, inputs_json, confirmed, status,
-                         started_at, dry_run)
-        VALUES(?, ?, ?, ?, 'running', ?, ?)
+                         started_at, dry_run, queued_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
             workflow_version_id,
             canonical_json(inputs),
             int(confirmed),
+            status,
             now_iso(),
             int(dry_run),
+            queued_at,
         ),
+    )
+
+
+def claim_queued_run(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """Take the oldest queued run and mark it running, or return None.
+
+    The UPDATE carries its own ``status = 'queued'`` test, so if another worker
+    took the run between the SELECT and here it changes no rows and we look
+    again. That is the whole of the concurrency control: no RETURNING, no
+    transaction gymnastics, and it behaves the same on any SQLite.
+    """
+    while True:
+        row = conn.execute(
+            "SELECT id FROM runs WHERE status = 'queued' ORDER BY queued_at, rowid LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        taken = conn.execute(
+            "UPDATE runs SET status = 'running' WHERE id = ? AND status = 'queued'",
+            (row["id"],),
+        ).rowcount
+        conn.commit()
+        if taken:
+            return find_run(conn, str(row["id"]))
+
+
+def count_runs_with_status(conn: sqlite3.Connection, status: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM runs WHERE status = ?", (status,)
+    ).fetchone()
+    return int(row["n"])
+
+
+def approve_run(conn: sqlite3.Connection, run_id: str) -> bool:
+    """Move a parked run into the queue. False if it was not parked."""
+    stamp = now_iso()
+    return bool(
+        conn.execute(
+            """
+            UPDATE runs SET status = 'queued', queued_at = ?, approved_at = ?
+            WHERE id = ? AND status = 'awaiting_approval'
+            """,
+            (stamp, stamp, run_id),
+        ).rowcount
+    )
+
+
+def close_parked_run(
+    conn: sqlite3.Connection, run_id: str, *, status: str, note: str
+) -> bool:
+    """End a parked run without running it -- refused, or nobody answered."""
+    return bool(
+        conn.execute(
+            """
+            UPDATE runs SET status = ?, approval_note = ?, finished_at = ?
+            WHERE id = ? AND status = 'awaiting_approval'
+            """,
+            (status, note, now_iso(), run_id),
+        ).rowcount
+    )
+
+
+def list_parked_runs(
+    conn: sqlite3.Connection, *, created_before: str | None = None
+) -> list[sqlite3.Row]:
+    """Runs waiting on a human, oldest first. ``created_before`` finds the stale ones."""
+    if created_before is None:
+        return list(
+            conn.execute(
+                "SELECT * FROM runs WHERE status = 'awaiting_approval' "
+                "ORDER BY started_at, rowid"
+            ).fetchall()
+        )
+    return list(
+        conn.execute(
+            "SELECT * FROM runs WHERE status = 'awaiting_approval' AND started_at < ? "
+            "ORDER BY started_at, rowid",
+            (created_before,),
+        ).fetchall()
     )
 
 
