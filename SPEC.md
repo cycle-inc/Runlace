@@ -253,8 +253,8 @@ accepted workflow.
 
 # v2 — Background execution
 
-**Nothing below is built.** M7–M9 follow the same rule as M1–M6: strictly in
-order, each ends with passing tests and a demo.
+**M7 is shipped. M8–M9 are not.** They follow the same rule as M1–M6: strictly
+in order, each ends with passing tests and a demo.
 
 ## Who the actors are
 
@@ -347,6 +347,17 @@ Acceptance: a workflow enqueued with `wait=0` returns a `run_id` immediately and
 reaches `completed` without the caller ever blocking; a side-effect workflow
 parks, is approved, and runs, with the whole sequence journaled; killing and
 restarting the daemon leaves a queued run still queued and it completes.
+
+*Shipped.* Two things the spec had not settled, decided while building it.
+**Parking needs somewhere to come back to**, so it only happens when a daemon
+is draining; over stdio nothing would ever resume the run, and the v1 refusal
+stays the right answer there. **What the gates decided is stored on the run**
+(`runs.side_effects_json`), not worked out again when a worker picks it up: a
+human says yes to the list they were shown, not to whatever `policy.yaml` says
+an hour later. Still open, and deferred to M8 with the HTTP layer: a daemon
+killed mid-flight leaves its run `running` for ever — nothing reclaims an
+orphan, because reclaiming one means deciding whether to re-run side effects
+that may already have happened.
 
 **M8 — The derived endpoint.** The same daemon serves `POST
 /workflows/{name}/run` (202 + `run_id` + `Location`, or `?wait=N`), `GET
