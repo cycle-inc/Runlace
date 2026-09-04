@@ -25,8 +25,10 @@ Three deliverables:
    `get_workflow`, `run_workflow`, `get_skill`) to any MCP host.
 3. A **SKILL.md** that teaches the agent how to write workflow code for this runtime.
 
-The LLM writes a workflow **once**; afterwards the workflow runs with **no model
-in the loop**: zero tokens, zero non-determinism. Robustness is enforced at
+The LLM writes a workflow **once**; afterwards the workflow runs with ~~**no model
+in the loop**: zero tokens, zero non-determinism~~ **no model in the loop unless
+the workflow asked for one** — see [v3](#v3--judgement-inside-a-workflow), which
+adds `ctx.ai(...)` and supersedes this sentence. Robustness is enforced at
 **create time** (static analysis + type checking), not discovered at run time.
 
 ## Locked decisions (do not revisit while implementing)
@@ -253,8 +255,9 @@ accepted workflow.
 
 # v2 — Background execution
 
-**M7 is shipped. M8–M9 are not.** They follow the same rule as M1–M6: strictly
-in order, each ends with passing tests and a demo.
+**M7 is shipped. M8–M9 are not**, and [M10](#v3--judgement-inside-a-workflow)
+now comes before them. Same rule as M1–M6 otherwise: strictly in order, each
+ends with passing tests and a demo.
 
 ## Who the actors are
 
@@ -376,3 +379,140 @@ an automation that runs every morning without anyone in the loop. Small, because
 M7 built the queue and M8 built the entry points. Acceptance: a scheduled
 workflow fires on time, is journaled with its trigger recorded, and a
 side-effect one parks instead of firing blind.
+
+---
+
+# v3 — Judgement inside a workflow
+
+**M10 is next, ahead of M8 and M9.** The order is now M10 → M8 → M9. Nothing in
+M10 needs the HTTP layer or the scheduler, and a workflow that can only move
+data between MCP servers cannot do most of what people actually want automated.
+
+## What changes, and what does not
+
+A workflow today is plumbing. It can call tools, branch on their output, and
+shape a result — but every branch has to be expressible as Python written months
+earlier by an agent that had never seen the data. "Is this invoice a duplicate",
+"which of these forty tickets is the same bug", "write the reply" — none of that
+is a `if` statement, and today the only way to get it is to hand the data back
+to the calling agent and let it decide, which costs a round trip, leaks the raw
+data into the chat transcript, and cannot happen at all in a scheduled run where
+no agent is listening.
+
+So a workflow gains **one new call**:
+
+```python
+verdict = ctx.ai(
+    system="You classify expense lines. Answer only with the schema.",
+    user=f"Line: {line['label']} — {line['amount']}€",
+    schema={"type": "object",
+            "properties": {"category": {"type": "string"},
+                           "confidence": {"type": "number"}},
+            "required": ["category", "confidence"]},
+)
+if verdict["confidence"] > 0.8:
+    ctx.pennylane.categorise(line_id=line["id"], category=verdict["category"])
+```
+
+**The honest cost.** v1's headline was "zero tokens, zero non-determinism". Half
+of that is now gone and it should be said plainly rather than quietly dropped
+from the README:
+
+- **Determinism dies** at every `ctx.ai` call. Same inputs, possibly different
+  output. A workflow that uses it is no longer replayable in the strict sense.
+- **Replayability, auditability and the gates survive**, and they are what the
+  product was actually selling. The *structure* is still compiled, still
+  typechecked, still pinned to real tool schemas; judgement is delegated at
+  **named, typed, journaled points** rather than smeared across an agent loop.
+  Every call, its prompts, its answer and its token count land in `steps`.
+- **Workflows that do not call `ctx.ai` are unchanged** — zero tokens, fully
+  deterministic, exactly as before. This is opt-in per workflow, per line.
+
+The one-sentence version for the README: *the agent decides the shape once; the
+workflow runs that shape forever, and asks a model only where you told it to.*
+
+## Locked decisions for v3
+
+Named, not numbered, as in v2.
+
+| Name | Decision |
+|---|---|
+| **the-model-is-declared-once** | The model, its endpoint and its key are configured **at `runlace init`** (or `runlace model set`) and live in `~/.runlace/model.json`. Workflow code never names a model, a provider, a temperature or a token budget — `ctx.ai(system=…, user=…, schema=…)` is the whole surface. Two reasons and both are load-bearing: the agent writing the workflow is not the party who pays for inference or answers for where the data went, so it does not get to choose; and a workflow that hard-codes `gpt-4o-mini` is a workflow that breaks the day the developer switches to a local model. A per-call `model=` override is deliberately deferred — it is easy to add later and impossible to remove. |
+| **one-openai-shaped-client** | Ollama, LiteLLM, OpenRouter, vLLM, llama.cpp and the commercial APIs all speak `POST /v1/chat/completions`. Runlace implements that one shape over `httpx` and nothing else. No provider SDKs, no LangChain, no litellm-as-a-dependency: a `base_url` plus a `model` plus an optional key covers every backend a user will plausibly have, and the ones it does not cover, LiteLLM already proxies. |
+| **the-schema-is-the-contract** | With a `schema`, `ctx.ai` returns a `dict` **validated against that JSON Schema with Pydantic** before the workflow ever sees it. Invalid output is retried **once**, with the validation error fed back to the model as a further turn; a second failure fails the step like any other tool error. The schema is also sent to the backend as `response_format: json_schema` when it accepts one, but validation happens locally regardless, because "the provider said it supports it" is not evidence. Without a `schema`, `ctx.ai` returns the raw `str`. |
+| **runtime-typed-not-static** | `ctx.ai(..., schema=...)` is typed `dict[str, Any]` in the stubs, not a generated `TypedDict`. pyright therefore will **not** catch `verdict["categorie"]`. This is a real hole and it is accepted on purpose: the schema is a literal in the workflow body, so deriving a static type from it means running the compiler over the AST of a dict literal and synthesising a `.pyi` per call site — a large amount of machinery for a guarantee the run-time validation already provides, one line later, with a better error message. Revisit only if it bites in practice. |
+| **distance-decides-the-risk** | An AI step is a tool call and gets a risk like any other. **A model on loopback (`localhost`, `127.0.0.1`, `[::1]`) is `read_only`**: nothing left the machine. **Anything else is `side_effect`**, because sending the user's invoice lines to a third party *is* an effect on the world, and it is exactly the effect a developer wants a gate on. So a workflow using a remote model parks for approval unless the developer allowed it, and a dry run **simulates** the remote call while **really running** the local one. Overridable per model in `policy.yaml`, same mechanism as any other tool. |
+| **an-ai-step-is-a-journaled-step** | No new table, no new trace format. An AI call is a row in `steps` with `connector = "ai"`, the prompts as its payload, the answer as its result, and two new columns for tokens. Whatever the journal already does — truncation budgets, `get_step`, timings, the failure path — it does for AI steps for free. `ai` becomes a **reserved connector name**: `add_connector` refuses it. |
+
+## Configuration
+
+A new file, deliberately not `config.json`: `write_config` rewrites that
+document wholesale and every existing caller would erase a model section it does
+not know about. An inference backend is also not an MCP connector and modelling
+it as one would mean faking a `tools/list`.
+
+```jsonc
+// ~/.runlace/model.json
+{
+  "version": 1,
+  "base_url": "http://localhost:11434/v1",   // Ollama; LiteLLM, OpenRouter, … all fit
+  "model": "qwen3:8b",
+  "api_key": "${OPENROUTER_API_KEY}",        // optional, ${VAR} as in config.json
+  "timeout": 120
+}
+```
+
+`${VAR}` expansion is the same code path as connectors — **a key is never
+written to disk**. No file means no model configured, and `create_workflow`
+**refuses at create time** a workflow that calls `ctx.ai` with a message telling
+the agent to have the human run `runlace model set`. Failing at create time
+rather than at run time is the whole point of the compiler.
+
+## Schema delta
+
+```sql
+-- v7
+ALTER TABLE steps ADD COLUMN tokens_in  INTEGER;   -- NULL for tool steps
+ALTER TABLE steps ADD COLUMN tokens_out INTEGER;
+```
+
+Cost is the first question anyone asks about a workflow that calls a model, and
+the journal is the only place that can answer it.
+
+## What stays out of scope in v3
+
+The model calling tools by itself (that is an agent, and the whole thesis is
+that the *workflow* holds the control flow) · streaming · multi-turn
+conversations inside one `ctx.ai` call · embeddings, vision, audio · a per-call
+`model=` override · enforced cost budgets and rate limits · caching identical
+prompts · fine-tuning anything.
+
+## Milestone
+
+**M10 — AI steps.** Four increments, each with tests, in this order.
+
+1. **The backend.** `model.json` read/write with `${VAR}` expansion, `runlace
+   model set` / `runlace model show`, the question added to `runlace init`, and
+   an OpenAI-shaped client over `httpx` returning text plus token counts.
+2. **The bridge.** `ctx.ai` on the shim, travelling the existing pipe as
+   `connector="ai"`; `render_ctx_stub` gains an `Ai` class with two overloads
+   (`str` without a schema, `dict[str, Any]` with one); `extract_tool_calls`
+   learns the one-attribute-deep shape so the compiler sees the call; create-time
+   refusal when no model is configured or when a `schema` is not a valid JSON
+   Schema literal; `steps` v7 and the token columns.
+3. **The gates.** Risk from the configured `base_url`, taking the stricter of
+   pinned and current as `_effective_risk` already does; parking and `confirm`
+   behave for a remote model exactly as for `gmail.send_email`; dry run
+   synthesises the remote answer from the schema and really calls a local model.
+4. **The story.** SKILL.md teaches `ctx.ai` — when to reach for it, why the
+   model is not the agent's to choose, and that a schema is not optional in
+   practice — and the "no model in the loop" claim is rewritten in README,
+   SKILL.md and the MCP server's instructions.
+
+Acceptance: a workflow that classifies its input with a local Ollama model runs
+end to end and its AI step is in the journal with prompts, answer and token
+counts; a schema-violating answer is retried once and then fails the step with a
+readable message; the same workflow pointed at a remote `base_url` parks for
+approval instead of running; a dry run of it returns a synthesised answer and
+makes no HTTP request; `create_workflow` refuses `ctx.ai` when no model is
+configured.

@@ -8,13 +8,21 @@ wholesale replacement ``init`` does.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from .config import Connector, default_config_sources, load_env_file
+from .ai import AiFailed, complete
+from .config import (
+    _ENV_REF,
+    Connector,
+    MissingEnvVars,
+    default_config_sources,
+    load_env_file,
+)
 from .connect_cmd import (
     LiteralSecret,
     add_connectors,
@@ -25,6 +33,13 @@ from .connect_cmd import (
     unresolved_references,
 )
 from .init_cmd import InitReport, format_table, run_init
+from .model import (
+    DEFAULT_BASE_URL,
+    DEFAULT_TIMEOUT,
+    Model,
+    read_model,
+    write_model,
+)
 from .paths import RunlacePaths, paths as runlace_paths
 from .queue import APPROVAL_ASK, APPROVAL_MODES
 from .server import serve as serve_server
@@ -78,6 +93,18 @@ def init(
     verify: Annotated[
         bool, typer.Option(help="Typecheck the generated stubs with pyright.")
     ] = True,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Model workflows reach through ctx.ai(...), e.g. qwen3:8b. "
+            "Same thing as `runlace model set`.",
+            show_default=False,
+        ),
+    ] = None,
+    model_base_url: Annotated[
+        str, typer.Option("--model-base-url", help="Where that model lives.")
+    ] = DEFAULT_BASE_URL,
     env_file: EnvFiles = None,
 ) -> None:
     """Set up ~/.runlace, discover your MCP servers, and generate typed stubs."""
@@ -101,6 +128,8 @@ def init(
 
     for warning in report.warnings:
         typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW)
+
+    _init_model(paths, model, model_base_url, assume_yes=yes)
 
     if verify:
         result = check_stubs(paths.types)
@@ -370,6 +399,152 @@ def serve(
         )
     # stdio is the transport: anything printed to stdout would corrupt it.
     serve_server(paths, port=http, host=host, approval=approval)
+
+
+def _init_model(
+    paths: RunlacePaths, name: str | None, base_url: str, *, assume_yes: bool
+) -> None:
+    """Offer to pick a model during init. Never blocks setting a home up.
+
+    Skipping is fine: workflows that do not call `ctx.ai(...)` never need one,
+    and `runlace model set` exists for later. What is not fine is finding out
+    only when a workflow is refused, so a home without a model says so.
+    """
+    if name is None:
+        if assume_yes or read_model(paths.model) is not None:
+            return
+        typer.echo("")
+        name = typer.prompt(
+            "Model for ctx.ai(...) steps, blank to skip",
+            default="",
+            show_default=False,
+        ).strip()
+        if not name:
+            typer.secho(
+                "  No model. Workflows calling ctx.ai() are refused until "
+                "`runlace model set <name>`.",
+                fg=typer.colors.BRIGHT_BLACK,
+            )
+            return
+
+    model = Model(base_url=base_url, model=name)
+    write_model(paths.model, model)
+    typer.echo("")
+    typer.echo(f"Model: {model.model}  {model.base_url}")
+    _describe(model)
+
+
+model_app = typer.Typer(
+    add_completion=False,
+    help="The model `ctx.ai(...)` calls. One per machine, chosen here.",
+    no_args_is_help=True,
+)
+app.add_typer(model_app, name="model")
+
+
+@model_app.command("set")
+def model_set(
+    name: Annotated[
+        str,
+        typer.Argument(help="Model name as the backend spells it, e.g. qwen3:8b."),
+    ],
+    base_url: Annotated[
+        str,
+        typer.Option(
+            "--base-url",
+            help="OpenAI-compatible endpoint. Ollama, LiteLLM, OpenRouter, vLLM "
+            "all expose one.",
+        ),
+    ] = DEFAULT_BASE_URL,
+    api_key: Annotated[
+        str | None,
+        typer.Option(
+            "--api-key",
+            help='Pass a reference, not the key itself: "${OPENROUTER_API_KEY}".',
+            show_default=False,
+        ),
+    ] = None,
+    timeout: Annotated[
+        float, typer.Option(help="Seconds to wait for one completion.")
+    ] = DEFAULT_TIMEOUT,
+    check: Annotated[
+        bool, typer.Option(help="Ask the model to say hello before saving.")
+    ] = True,
+    env_file: EnvFiles = None,
+) -> None:
+    """Choose the model workflows reach through `ctx.ai(...)`.
+
+    Set here and not in workflow code: the agent writing a workflow is not the
+    one paying for inference or answering for where the data went, and a
+    workflow that hard-codes a model breaks the day you switch to a local one.
+    """
+    paths = _existing_home()
+    _load_env_files(env_file)
+    if api_key and not _ENV_REF.search(api_key):
+        typer.secho(
+            str(
+                LiteralSecret(
+                    "--api-key", '"${RUNLACE_MODEL_KEY}" (or any name you like)'
+                )
+            ).replace("config.json", "model.json"),
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    model = Model(base_url=base_url, model=name, api_key=api_key, timeout=timeout)
+    if check:
+        typer.echo(f"Asking {name} at {base_url} to answer once...")
+        try:
+            answer = asyncio.run(
+                complete(
+                    model.resolved(),
+                    [{"role": "user", "content": "Reply with the single word: ready"}],
+                )
+            )
+        except (AiFailed, MissingEnvVars) as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            typer.secho(
+                "Nothing was saved. Re-run with --no-check to save it anyway.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            raise typer.Exit(code=1) from exc
+        typer.secho(f"  {answer.text.strip()[:80]}", fg=typer.colors.BRIGHT_BLACK)
+
+    write_model(paths.model, model)
+    typer.echo(f"Saved to {paths.model}")
+    _describe(model)
+
+
+@model_app.command("show")
+def model_show() -> None:
+    """Print the configured model. Never prints a resolved key."""
+    paths = _existing_home()
+    model = read_model(paths.model)
+    if model is None:
+        typer.secho(
+            "No model configured. `runlace model set <name>` picks one; "
+            "workflows calling ctx.ai() are refused until then.",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"{model.model}  {model.base_url}")
+    _describe(model)
+
+
+def _describe(model: Model) -> None:
+    """The one thing about a model that changes how a workflow behaves."""
+    if model.is_local:
+        typer.echo("  local: AI steps count as reads and run without approval.")
+    else:
+        typer.echo(
+            "  remote: AI steps count as side effects, because the data leaves "
+            "this machine. Workflows using them park for approval."
+        )
+    if model.api_key:
+        # The reference, deliberately -- the value is only ever in the environment.
+        typer.echo(f"  key: {model.api_key}")
 
 
 def _existing_home() -> RunlacePaths:

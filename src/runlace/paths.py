@@ -29,6 +29,16 @@ class RunlacePaths:
         return self.home / "policy.yaml"
 
     @property
+    def model(self) -> Path:
+        """The inference backend `ctx.ai` calls. Absent until one is configured.
+
+        Its own file rather than a section of ``config.json``: writing that
+        document replaces it whole, so every caller that does not know about a
+        model section would erase one.
+        """
+        return self.home / "model.json"
+
+    @property
     def types(self) -> Path:
         return self.home / "runlace_types"
 
