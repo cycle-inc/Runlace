@@ -156,7 +156,9 @@ class Worker:
 
         The inputs come back off the run and not out of the workflow's defaults:
         they are what was validated, and for a parked run they are what a human
-        was shown. Nothing between admission and here may change them.
+        was shown. Nothing between admission and here may change them. Same for
+        the side effects -- a run approved on the strength of "this sends one
+        email" must not act on a `policy.yaml` edited since.
         """
         row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         if row is None:
@@ -174,12 +176,20 @@ class Worker:
             return None
 
         inputs: dict[str, Any] = json.loads(str(row["inputs_json"] or "{}"))
+        stored = row["side_effects_json"]
         return Admitted(
             run_id=run_id,
             record=record,
             inputs=inputs,
             dry_run=bool(row["dry_run"]),
-            side_effects=side_effects_of(read_policy(self.paths.policy), record),
+            # NULL for a run written before the column existed, and for one with
+            # no side effects at all. Recomputing gives the right answer in the
+            # second case and the best available one in the first.
+            side_effects=(
+                json.loads(str(stored))
+                if stored is not None
+                else side_effects_of(read_policy(self.paths.policy), record)
+            ),
         )
 
     def _heartbeat(self, conn: Connection) -> bool:

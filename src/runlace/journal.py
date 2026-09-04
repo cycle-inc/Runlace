@@ -83,6 +83,11 @@ def get_run(conn: Connection, run_id: str) -> dict[str, Any]:
         "steps": [_step_summary(step) for step in list_steps(conn, run_id)],
     }
     if status == AWAITING_APPROVAL:
+        # What it wants to act with, and what it would act on. A developer's app
+        # listing pending approvals renders these; it does not have the answer
+        # run_workflow gave, and may not even be the process that got it.
+        result["side_effects"] = _decode(row["side_effects_json"]) or []
+        result["inputs"] = _decode(row["inputs_json"]) or {}
         result["hint"] = (
             "It is waiting for a human to approve it. Nothing has run and "
             "nothing will until approve_run is called with this run_id."

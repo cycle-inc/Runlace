@@ -26,6 +26,7 @@ from .connect_cmd import (
 )
 from .init_cmd import InitReport, format_table, run_init
 from .paths import RunlacePaths, paths as runlace_paths
+from .queue import APPROVAL_ASK, APPROVAL_MODES
 from .server import serve as serve_server
 from .sync_cmd import format_broken, format_changes, run_sync
 from .typecheck import check_stubs
@@ -328,10 +329,29 @@ def serve(
             help="Interface to bind --http to. Use 0.0.0.0 to let a container reach it.",
         ),
     ] = "127.0.0.1",
+    approval: Annotated[
+        str,
+        typer.Option(
+            "--approval",
+            help="What a side-effecting run does without confirm: "
+            "ask (park it for a human) or allow (run it).",
+        ),
+    ] = APPROVAL_ASK,
     env_file: EnvFiles = None,
 ) -> None:
-    """Start the Runlace MCP server so any MCP host can add it."""
+    """Start the Runlace MCP server so any MCP host can add it.
+
+    `--approval` is the one gate the agent cannot open for itself. It belongs to
+    whoever runs this command, which is the developer embedding Runlace, not the
+    person their product is talking to -- see the v2 chapter of SPEC.md.
+    """
     paths = runlace_paths()
+    if approval not in APPROVAL_MODES:
+        typer.secho(
+            f"--approval must be one of {', '.join(APPROVAL_MODES)}.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
     _load_env_files(env_file)
     if not paths.db.exists():
         typer.secho(
@@ -349,7 +369,7 @@ def serve(
             err=True,
         )
     # stdio is the transport: anything printed to stdout would corrupt it.
-    serve_server(paths, port=http, host=host)
+    serve_server(paths, port=http, host=host, approval=approval)
 
 
 def _existing_home() -> RunlacePaths:

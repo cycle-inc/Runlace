@@ -4,9 +4,15 @@ The order is the spec's, and it is the whole point of this module:
 
 1. validate ``inputs`` against the declared schema (D7);
 2. refuse if any pinned tool's schema has drifted since the workflow compiled;
-3. refuse if the workflow has side effects and ``confirm`` was not passed (D6);
+3. stop if the workflow has side effects and ``confirm`` was not passed (D6);
 4. run it in the subprocess, journaling every tool call as it happens;
 5. validate the return value against ``outputs_schema`` if there is one.
+
+Step 3 stops in one of two ways, and which one depends on whether there is a
+daemon to come back to. With one, the run is *parked*: it keeps its inputs and
+waits for the developer's product to ask a human we cannot reach. Without one
+there is nobody to resume it later, so it is refused the way v1 refused it --
+tell the human in the conversation and call again with ``confirm``.
 
 Every attempt that got as far as naming a version is journaled, refusals
 included -- ``runs`` and ``steps`` are the audit log, not a success log.
@@ -34,12 +40,20 @@ from .db import (
     finish_run,
     insert_run,
     insert_step,
+    park_run,
     tool_output_schemas,
 )
 from .journal import get_run as read_run
 from .paths import RunlacePaths
 from .policy import Policy, read_policy
-from .queue import QUEUED, TERMINAL, has_live_worker
+from .queue import (
+    APPROVAL_ASK,
+    AWAITING_APPROVAL,
+    CODE_AWAITING_APPROVAL,
+    QUEUED,
+    TERMINAL,
+    has_live_worker,
+)
 from .runner import (
     DEFAULT_TIMEOUT_SECONDS,
     STATUS_COMPLETED,
@@ -73,8 +87,15 @@ POLL_SECONDS = 0.02
 
 
 @dataclass(frozen=True)
-class Refused:
-    """A run the gates turned away. ``result`` is the answer, already shaped."""
+class Answered:
+    """The gates settled it themselves; nothing is going to execute now.
+
+    Two things end this way and they are not the same thing: a run that was
+    turned away, and a run that is parked waiting for a human. Both leave
+    :func:`admit` with the whole answer already shaped, which is all its caller
+    needs to know -- what to tell whoever asked, and that there is nothing to
+    hand to a worker.
+    """
 
     result: dict[str, Any]
 
@@ -108,6 +129,7 @@ async def run_workflow(
     call_tool: CallTool | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     wait: float | None = None,
+    approval: str = APPROVAL_ASK,
 ) -> dict[str, Any]:
     """Run one stored workflow. Returns a result; it does not raise for failures.
 
@@ -131,6 +153,10 @@ async def run_workflow(
     server is exactly the kind of thing that must be in the answer rather than
     in the docs.
 
+    ``approval`` is the developer's, set where they launch Runlace, and never
+    the agent's: ``ask`` parks a side-effecting run until a human answers,
+    ``allow`` lets it through because their product got approval its own way.
+
     ``call_tool`` is injectable so tests can run a real subprocess against fake
     tools. Left unset, sessions are opened to the connectors the workflow uses;
     it also forces the inline path, because a worker in another process has no
@@ -146,8 +172,9 @@ async def run_workflow(
         version=version,
         dry_run=dry_run,
         queued=handed_over,
+        approval=approval,
     )
-    if isinstance(admission, Refused):
+    if isinstance(admission, Answered):
         return admission.result
     if not handed_over:
         result = await execute(
@@ -167,21 +194,26 @@ def admit(
     version: str | None = None,
     dry_run: bool = False,
     queued: bool = False,
-) -> Refused | Admitted:
+    approval: str = APPROVAL_ASK,
+) -> Answered | Admitted:
     """The gates: everything that can be decided before anything executes.
 
     Writes the run row, so a refusal is journaled like any other attempt, and
     touches no MCP server -- this is cheap and synchronous on purpose.
 
     ``queued`` puts the run in the queue once it passes, for the caller that is
-    about to hand it to a worker instead of executing it. The row is opened as
-    ``running`` either way and only joins the queue at the end: a run that is
-    claimable while the gates are still deciding could be picked up and executed
-    a millisecond before being refused.
+    about to hand it to a worker instead of executing it. It is also what makes
+    parking possible at all: parking a run only means something if something
+    will still be there to run it once a human answers.
+
+    The row is opened as ``running`` whatever happens, and only joins the queue
+    or the parked pile at the very end. A run that is claimable -- or
+    approvable -- while the gates are still deciding could be picked up and
+    executed a millisecond before being refused.
     """
     record = get_workflow(conn, workflow, version=version)
     if record is None:
-        return Refused(
+        return Answered(
             _refused(
                 None,
                 CODE_UNKNOWN_WORKFLOW,
@@ -190,7 +222,7 @@ def admit(
             )
         )
     if record.get("version") is None:
-        return Refused(
+        return Answered(
             _refused(
                 None,
                 CODE_UNKNOWN_WORKFLOW,
@@ -199,7 +231,7 @@ def admit(
             )
         )
     if not isinstance(record.get("code"), str):
-        return Refused(
+        return Answered(
             _refused(
                 None,
                 CODE_NO_CODE,
@@ -211,6 +243,10 @@ def admit(
 
     given = dict(inputs or {})
     resolved = apply_defaults(record.get("inputs_schema"), given)
+    # Worked out before the run row is written so that what the gates decided is
+    # stored with the run rather than recomputed later against a policy file
+    # somebody edited in between.
+    side_effects = side_effects_of(read_policy(paths.policy), record)
 
     run_id = f"run_{uuid.uuid4().hex[:12]}"
     insert_run(
@@ -220,11 +256,12 @@ def admit(
         inputs=resolved,
         confirmed=confirm,
         dry_run=dry_run,
+        side_effects=side_effects,
     )
     conn.commit()
 
-    def refuse(code: str, error: str, hint: str, **extra: Any) -> Refused:
-        return Refused(
+    def refuse(code: str, error: str, hint: str, **extra: Any) -> Answered:
+        return Answered(
             _fail(conn, run_id, record, code, error, hint, dry_run=dry_run, **extra)
         )
 
@@ -251,18 +288,19 @@ def admit(
             drift=drift,
         )
 
-    # 3. confirm (D6)
-    side_effects = side_effects_of(read_policy(paths.policy), record)
-    if side_effects and not confirm and not dry_run:
-        names = ", ".join(f"{t['connector']}.{t['tool']}" for t in side_effects)
-        return refuse(
-            CODE_NEEDS_CONFIRMATION,
-            f"this workflow performs side effects ({names}) and was called "
-            f"without confirm",
-            "Show the human exactly which tools will act, and call run_workflow "
-            "again with confirm=True only after they agree.",
-            side_effects=side_effects,
-        )
+    # 3. approval (D6)
+    if side_effects and not confirm and not dry_run and approval == APPROVAL_ASK:
+        if not queued:
+            return refuse(
+                CODE_NEEDS_CONFIRMATION,
+                _acting(side_effects, "and was called without confirm"),
+                "Show the human exactly which tools will act, and call "
+                "run_workflow again with confirm=True only after they agree.",
+                side_effects=side_effects,
+            )
+        park_run(conn, run_id)
+        conn.commit()
+        return Answered(_parked(run_id, record, resolved, side_effects, dry_run))
 
     if queued:
         enqueue_run(conn, run_id)
@@ -492,6 +530,49 @@ async def _wait_for(
             }
         await asyncio.sleep(POLL_SECONDS)
     return _unfinished(conn, admitted)
+
+
+def _acting(side_effects: list[dict[str, Any]], tail: str) -> str:
+    names = ", ".join(f"{t['connector']}.{t['tool']}" for t in side_effects)
+    return f"this workflow performs side effects ({names}) {tail}"
+
+
+def _parked(
+    run_id: str,
+    record: dict[str, Any],
+    inputs: dict[str, Any],
+    side_effects: list[dict[str, Any]],
+    dry_run: bool,
+) -> dict[str, Any]:
+    """A run set aside until a human answers. Everything needed to ask them.
+
+    ``inputs`` are in the answer on purpose: the developer's product has to
+    render *what* is about to happen, and it should render the resolved inputs
+    -- defaults filled in, validated -- rather than the ones the agent typed.
+    Those are also the ones stored, so what the human is shown is what runs.
+
+    ``ok`` is false because nothing has happened yet. There is no failure here
+    and the ``code`` says so, but a model reading ``ok: True`` would tell its
+    user the email was sent.
+    """
+    return {
+        **_identity(run_id, record),
+        "ok": False,
+        "code": CODE_AWAITING_APPROVAL,
+        "status": AWAITING_APPROVAL,
+        "dry_run": dry_run,
+        "error": None,
+        "side_effects": side_effects,
+        "inputs": inputs,
+        "hint": _acting(
+            side_effects,
+            "and is waiting for a human to approve it. Nothing has run. You "
+            "cannot approve it yourself -- report this run_id to whoever asked "
+            "and let them answer through the product they are using.",
+        ),
+        "output": None,
+        "steps": [],
+    }
 
 
 def _unfinished(conn: Connection, admitted: Admitted) -> dict[str, Any]:

@@ -21,6 +21,7 @@ product to ask someone we will never meet.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -61,8 +62,19 @@ DEFAULT_APPROVAL_TTL_SECONDS = 24 * 60 * 60
 HEARTBEAT_SECONDS = 10.0
 STALE_AFTER_SECONDS = 3 * HEARTBEAT_SECONDS
 
+# What happens to a side-effecting run that arrives without `confirm`. This is
+# the developer's decision and nobody else's: they know whether their product is
+# an internal ops bot or a public agent, and those want opposite answers. It is
+# deliberately not an MCP tool and not something a workflow can set -- if the
+# agent could lift the gate it would lift it for itself, in the same turn it
+# wrote the workflow, and the gate would be theatre.
+APPROVAL_ASK = "ask"  # park it and wait for a human. The default.
+APPROVAL_ALLOW = "allow"  # run it; approval is handled somewhere we cannot see.
+APPROVAL_MODES = (APPROVAL_ASK, APPROVAL_ALLOW)
+
 CODE_UNKNOWN_RUN = "unknown-run"
 CODE_NOT_PARKED = "not-awaiting-approval"
+CODE_AWAITING_APPROVAL = "awaiting-approval"
 
 EXPIRY_NOTE = "no answer before the approval window closed"
 
@@ -113,6 +125,25 @@ def reject(conn: Connection, run_id: str, reason: str | None = None) -> dict[str
     close_parked_run(conn, run_id, status=REJECTED, note=note)
     conn.commit()
     return {"ok": True, "run_id": run_id, "status": REJECTED, "reason": note}
+
+
+def pending(conn: Connection) -> list[dict[str, Any]]:
+    """Every run waiting on a human, oldest first.
+
+    What a developer's product renders as "3 actions need your approval". It
+    exists because the answer ``run_workflow`` gave may be long gone: their
+    process restarted, or the person who has to answer is not the person who
+    asked. The run row is the only durable record, so it is the one to read.
+    """
+    return [
+        {
+            "run_id": str(row["id"]),
+            "started_at": row["started_at"],
+            "inputs": json.loads(str(row["inputs_json"] or "{}")),
+            "side_effects": json.loads(str(row["side_effects_json"] or "[]")),
+        }
+        for row in list_parked_runs(conn)
+    ]
 
 
 def expire(

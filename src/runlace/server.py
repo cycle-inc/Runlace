@@ -20,6 +20,7 @@ from .db import Connection, connect
 from .journal import get_run as _get_run
 from .journal import get_step as _get_step
 from .paths import RunlacePaths, paths as default_paths
+from .queue import APPROVAL_ASK
 from .runs import run_workflow as _run_workflow
 from .skill import build_skill, tool_types
 from .worker import Worker
@@ -40,13 +41,23 @@ among the connectors get_skill lists, add_connector connects a new server.
 """
 
 
-def build_server(paths: RunlacePaths | None = None, *, drain: bool = False) -> MCPServer:
+def build_server(
+    paths: RunlacePaths | None = None,
+    *,
+    drain: bool = False,
+    approval: str = APPROVAL_ASK,
+) -> MCPServer:
     """Create the MCP server. ``paths`` is injectable so tests can isolate it.
 
     ``drain`` also runs the queue worker for as long as the server is up. It is
     off by default because it is only true of a daemon: over stdio this process
     dies when the MCP host disconnects, and a run left going here would be
     killed mid-flight. See :mod:`runlace.worker`.
+
+    ``approval`` is what happens to a side-effecting run called without
+    ``confirm``. Whoever starts the server decides it; there is deliberately no
+    tool that changes it, because an agent that could lift the gate would lift
+    it for itself.
     """
     home = paths or default_paths()
 
@@ -281,9 +292,17 @@ def build_server(paths: RunlacePaths | None = None, *, drain: bool = False) -> M
         declares.
 
         Call this WITHOUT `confirm` first. If the workflow uses any tool that
-        acts on the world, it is refused with {code: "needs-confirmation",
-        side_effects: [...]}. Show the human exactly which tools those are, and
-        call again with confirm=True only after they agree in the conversation.
+        acts on the world, it does not run: you get back `side_effects`, the
+        list of tools that would act, and one of two codes.
+
+        "needs-confirmation" means show the human exactly which tools those are
+        and call again with confirm=True once they agree in the conversation.
+
+        "awaiting-approval" means the run has been parked and is waiting for a
+        person you cannot reach -- the answer comes back through whatever
+        application they are using, not through you. Do not call again with
+        confirm=True; that would be you approving your own run. Report the
+        run_id, say what is waiting on whom, and check get_run later.
 
         By default this waits for the run to finish. `wait` is how many seconds
         to stay with it instead: pass 0 to get a run_id back immediately, or a
@@ -309,6 +328,7 @@ def build_server(paths: RunlacePaths | None = None, *, drain: bool = False) -> M
                 confirm=confirm,
                 version=version,
                 wait=wait,
+                approval=approval,
             )
 
     @server.tool()
@@ -391,6 +411,7 @@ def serve(
     *,
     port: int | None = None,
     host: str = "127.0.0.1",
+    approval: str = APPROVAL_ASK,
 ) -> None:
     """Run the server on stdio, or over streamable HTTP when a port is given.
 
@@ -405,8 +426,8 @@ def serve(
     here would be killed the moment that host went away.
     """
     if port is None:
-        build_server(paths).run(transport="stdio")
+        build_server(paths, approval=approval).run(transport="stdio")
     else:
-        build_server(paths, drain=True).run(
+        build_server(paths, drain=True, approval=approval).run(
             transport="streamable-http", host=host, port=port
         )

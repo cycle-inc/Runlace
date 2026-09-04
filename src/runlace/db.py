@@ -133,6 +133,11 @@ MIGRATIONS = [
         hostname  TEXT NOT NULL,
         heartbeat TEXT NOT NULL
     )""",
+    # v6 (M7): which tools a parked run wants to act with, decided when it was
+    # parked. Stored rather than worked out again at approval time, because
+    # `policy.yaml` may have been edited in between and the human said yes to
+    # the list they were shown, not to whatever the file says an hour later.
+    "ALTER TABLE runs ADD COLUMN side_effects_json TEXT",
 ]
 
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
@@ -405,6 +410,7 @@ def insert_run(
     dry_run: bool = False,
     status: str = "running",
     queued_at: str | None = None,
+    side_effects: list[dict[str, Any]] | None = None,
 ) -> None:
     """Open a run. Written before anything is attempted, so a crash leaves a trace.
 
@@ -412,12 +418,15 @@ def insert_run(
     ``queued`` or ``awaiting_approval`` for one that goes into the queue instead.
     ``queued_at`` is set for the first of those and left NULL for the second --
     a parked run is not in line until a human puts it there.
+
+    ``side_effects`` is what the run will act with, as the gates saw it. Written
+    once, here, and never recomputed -- see the v6 migration.
     """
     conn.execute(
         """
         INSERT INTO runs(id, workflow_version_id, inputs_json, confirmed, status,
-                         started_at, dry_run, queued_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                         started_at, dry_run, queued_at, side_effects_json)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -428,6 +437,7 @@ def insert_run(
             now_iso(),
             int(dry_run),
             queued_at,
+            canonical_json(side_effects) if side_effects else None,
         ),
     )
 
@@ -506,6 +516,22 @@ def enqueue_run(conn: sqlite3.Connection, run_id: str) -> bool:
             "UPDATE runs SET status = 'queued', queued_at = ? "
             "WHERE id = ? AND status = 'running'",
             (now_iso(), run_id),
+        ).rowcount
+    )
+
+
+def park_run(conn: sqlite3.Connection, run_id: str) -> bool:
+    """Set an open run aside until a human answers. False if it is no longer open.
+
+    The mirror of :func:`enqueue_run`, and for the same reason: both are the
+    last thing that happens to a run the gates let through, so nothing can
+    claim it or approve it while the gates are still deciding.
+    """
+    return bool(
+        conn.execute(
+            "UPDATE runs SET status = 'awaiting_approval' "
+            "WHERE id = ? AND status = 'running'",
+            (run_id,),
         ).rowcount
     )
 

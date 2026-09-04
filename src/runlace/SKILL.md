@@ -39,9 +39,8 @@ that code once and get it to compile.
    and `new_string`: one exact string, matching once, copied out of the code
    `get_workflow` gave you. Sending the whole file back to change one line is
    where most mistakes come from. You get a new version; the old one stays.
-6. **`run_workflow`** — execute it for real. If the workflow touches any
-   side-effecting tool, the run is refused until you show the human exactly
-   which tools will act and call again with `confirm=True`.
+6. **`run_workflow`** — execute it for real. A workflow that touches any
+   side-effecting tool never just runs: see "When something is refused".
 
 ## The calling convention
 
@@ -378,6 +377,10 @@ Every refusal carries a `code`. The ones worth recognising:
 
 - `needs-confirmation` — the workflow acts. Show the human the `side_effects`
   list, then call `run_workflow` again with `confirm=True`.
+- `awaiting-approval` — the workflow acts, and this Runlace asks someone who is
+  not in this conversation. The run is parked, not refused: it keeps its inputs
+  and runs if they say yes. Do **not** retry with `confirm=True` — that is you
+  approving your own run. Report the `run_id` and check `get_run` later.
 - `invalid-inputs` — what you passed does not match the `inputs_schema` the
   workflow declares. `get_workflow` returns that schema.
 - `schema-drift` — a tool changed since the workflow compiled. Run
