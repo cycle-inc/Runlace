@@ -3,6 +3,7 @@ name = "runlace"
 version = "0.1.0"
 description = "Deterministic, replayable workflows over your MCP servers."
 readme = "README.md"
+authors = [{ name = "Runlace contributors" }]
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]

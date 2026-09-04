@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import replace
+from importlib import metadata
 from pathlib import Path
 from typing import Annotated
 
@@ -76,8 +77,25 @@ app = typer.Typer(
 )
 
 
+def _print_version(show: bool) -> None:
+    """The first thing any bug report needs, and the first thing people try."""
+    if show:
+        typer.echo(f"runlace {metadata.version('runlace')}")
+        raise typer.Exit()
+
+
 @app.callback()
-def _root() -> None:
+def _root(
+    show_version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_print_version,
+            is_eager=True,
+            help="Print the installed version and exit.",
+        ),
+    ] = False,
+) -> None:
     """Keeps `init` a subcommand; Typer would otherwise hoist a lone command."""
 
 

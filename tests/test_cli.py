@@ -33,6 +33,14 @@ def test_every_command_that_rediscovers_takes_an_env_file(command: str) -> None:
     assert "--env-file" in result.output
 
 
+def test_version_is_printed_without_a_home(tmp_path: Path) -> None:
+    """Every bug report starts with it, so it cannot need a set-up machine."""
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.startswith("runlace ")
+
+
 def test_a_missing_env_file_stops_before_anything_is_pruned(tmp_path: Path) -> None:
     """Silently carrying on would be the same failure with an extra step."""
     result = runner.invoke(

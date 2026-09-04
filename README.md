@@ -1,16 +1,41 @@
 # Runlace
 
-Replayable workflows over your MCP servers. An LLM writes a workflow once;
-afterwards it runs with no model in the loop, unless the workflow itself asked
-for one -- see [M10](#m10--judgement-inside-a-workflow).
+**An LLM writes the workflow once. After that it runs on its own -- same steps,
+same order, no model in the loop.**
 
-See `SPEC.md` for the full design. It is committed verbatim and still uses the
-working name `harness` throughout; everything in this repo has since been
-renamed to Runlace, including the on-disk names D2 and D10 spell out.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![CI](https://github.com/cycle-inc/Runlace/actions/workflows/ci.yml/badge.svg)](https://github.com/cycle-inc/Runlace/actions/workflows/ci.yml)
 
-**This repo implements M1 through M5 — every milestone in the spec — plus M6,
-the authoring loop: `dry_run_workflow` and `edit_workflow`. Ten MCP tools in
-all.**
+An agent wired to your MCP servers re-derives the same plan on every run. That
+costs tokens, it is slow, and it is not reproducible: the same request can
+produce two different sequences of calls. The moment a tool acts on the world --
+sends an email, issues a refund -- that variance stops being an annoyance.
+
+Runlace is a local MCP server that sits between your agent and the MCP servers
+it already talks to. Instead of driving tools one call at a time, the agent
+writes a Python workflow **once**. Runlace typechecks it against your real tool
+signatures, stores it, and from then on runs it directly. The reasoning is paid
+for once; every run after that is deterministic and replayable.
+
+```python
+from runlace_types import Ctx, Output
+
+
+def run(ctx: Ctx) -> Output:
+    """Escalate today's large failed payments."""
+    failed = ctx.stripe.list_charges(status="failed", limit=100)
+
+    big = [c for c in failed if c["amount"] > ctx.inputs["threshold"]]
+    if big:
+        ctx.slack.post_message(channel="#billing", text=f"{len(big)} large failures")
+
+    return {"failed": len(failed), "escalated": len(big)}
+```
+
+`ctx.stripe.list_charges` exists because you have a Stripe MCP server; the stubs
+are generated from your servers' own `tools/list`, so pyright catches an unknown
+tool or a misspelled argument before anything runs.
 
 ```
 uv tool install runlace          # or: uvx runlace init
@@ -21,7 +46,49 @@ runlace serve                    # add this to Claude Code, Cursor, anything
 To watch the whole loop in two minutes, against a real MCP server and with no
 API key: `./scripts/demo.sh`.
 
-## M1 — skeleton & discovery
+### What you get
+
+- **Determinism.** A stored workflow runs the same way every time. No model, no
+  drift -- unless it calls `ctx.ai(...)` itself, and then only there.
+- **A gate on anything that acts.** A workflow that only reads just runs. One
+  that sends, writes or deletes needs `confirm=True`, or parks for a human.
+- **A dry run.** Every read hits the live server; every side effect is answered
+  from its own declared output shape. Nothing is sent.
+- **A journal.** Every step, its arguments, its result, its duration, its
+  tokens -- in SQLite, readable after the fact.
+- **Judgement where you ask for it.** `ctx.ai(...)` asks the model this machine
+  is configured with, validates the answer against your JSON Schema, and is
+  journaled like any other step.
+- **No framework.** Python, pyright, SQLite, one HTTP client. Any
+  OpenAI-shaped endpoint: Ollama, LiteLLM, OpenRouter, vLLM, llama.cpp.
+
+### Status
+
+`0.1.0`, and honest about it: the design in `SPEC.md` is implemented end to end
+-- discovery, the compiler, the runner, the policy, the authoring loop, and
+`ctx.ai` -- as eleven MCP tools, with the full test suite and pyright green.
+What is not built yet: a derived HTTP endpoint per workflow, and triggers.
+
+`SPEC.md` is committed verbatim as it was written and still uses the working
+name `harness` throughout; everything in this repo has since been renamed to
+Runlace, including the on-disk names it spells out.
+
+### Contents
+
+| | |
+| --- | --- |
+| [Discovery](#discovery-your-mcp-servers-as-typed-python-m1) | `runlace init`, and the stubs it generates |
+| [The compiler](#the-compiler-writing-a-workflow-once-m2) | how a workflow is checked before it is stored |
+| [The runner](#the-runner-what-happens-when-one-runs-m3) | the sandbox, the gate, the journal |
+| [The skill and the policy](#the-skill-file-and-policyyaml-m4) | what the agent is taught, what you can override |
+| [Living with it](#living-with-it-sync-small-models-packaging-m5) | `runlace sync`, small models, packaging |
+| [The authoring loop](#the-authoring-loop-dry-run-then-edit-m6) | `dry_run_workflow`, `edit_workflow` |
+| [Judgement in a workflow](#judgement-inside-a-workflow-ctxai-m10) | `ctx.ai`, and which model answers it |
+| [Adding servers later](#adding-mcp-servers-after-the-first-run) | `runlace add`, `import`, `add_connector` |
+| [Context budget](#what-crosses-into-the-models-context) | what `get_skill` and `get_tools` actually cost |
+| [Development](#development) | tests, acceptance scripts, the decisions behind them |
+
+## Discovery: your MCP servers, as typed Python (M1)
 
 `runlace init` imports the MCP server definitions you already have, connects to
 each server, calls `tools/list`, and turns the result into typed Python stubs
@@ -63,10 +130,10 @@ spelling alongside (`get-annotated-message` → `get_annotated_message`).
 Reserved words in parameters get a trailing underscore (`from` → `from_`) and
 the docstring records the mapping.
 
-## M2 — the compiler
+## The compiler: writing a workflow once (M2)
 
-`runlace serve` starts an MCP server that any host can add. It exposes five
-tools:
+`runlace serve` starts an MCP server that any host can add. Eleven tools in
+all; these five are the core, and the sections below add the rest:
 
 | tool | what it does |
 | --- | --- |
@@ -117,7 +184,7 @@ existing version instead of duplicating it.
 ~/.runlace/workflows/<name>/<version>.py
 ```
 
-## M3 — the runner
+## The runner: what happens when one runs (M3)
 
 `run_workflow` executes a stored version. Nothing calls a model unless the
 workflow's own code does (M10); otherwise it just runs.
@@ -168,7 +235,7 @@ Every attempt is journaled, refusals included — `runs` and `steps` are the
 audit log, the debug trace and the foundation for v2 resume, so a refused run
 still gets a `run_id` you can show a human.
 
-### Not in M3
+### What the runner does not do
 
 `runlace sync` and the full SKILL.md are M4. Resume, scheduling and streaming
 progress are v2.
@@ -202,7 +269,7 @@ separate `dry_run_workflow` tool outside the compiler instead — and without th
 two-tier guarantee, because a side-effecting tool is stood in rather than
 skipped.
 
-## M4 — the skill and the policy
+## The skill file, and `policy.yaml` (M4)
 
 `get_skill` now returns the real `SKILL.md` (`src/runlace/SKILL.md`, shipped
 with the package) instead of a primer: the calling convention, the file
@@ -236,12 +303,12 @@ than "nothing works". An override that matches no tool on this machine is
 reported at `init`, since that typo fails in the dangerous direction: you
 believe a tool is gated and it is not.
 
-### Not in M4
+### What the policy does not cover
 
 `runlace sync` as a command is M5; the dry run described above is unbuilt.
 Resume, scheduling and streaming progress are v2.
 
-## M5 — launch
+## Living with it: sync, small models, packaging (M5)
 
 ### `runlace sync`
 
@@ -304,7 +371,7 @@ The wheel carries `SKILL.md` and `py.typed`; `scripts/m5_acceptance.sh` installs
 it into an empty environment with no repo around it and runs `init` and `sync`
 from there, because "it works in the checkout" is not the claim being made.
 
-## M6 — the authoring loop
+## The authoring loop: dry run, then edit (M6)
 
 `SPEC.md` stops at M5. M6 is the loop the spec's five tools leave to the agent's
 patience: write the whole file, run it for real, and hope. Two tools close it,
@@ -344,7 +411,7 @@ version that was edited stays on disk, readable and runnable.
 dry run that finds it on real data without toggling anything, a one-string fix,
 a second dry run that passes, then refused-without-confirm and completed-with-it.
 
-## M10 — judgement inside a workflow
+## Judgement inside a workflow: `ctx.ai` (M10)
 
 Some steps are not code. "Is this invoice hosting or travel", "summarise this
 thread in one line": no `if` gets there, and a workflow that cannot ask stops at
@@ -861,3 +928,27 @@ And these in M6:
 - **Every new version is told it has never run.** Compiling is not evidence that
   a workflow works, and an optional verification step nobody is told about is a
   step nobody takes, so the `create_workflow` result names `dry_run_workflow`.
+
+## Contributing
+
+Bug reports, workflows that broke, and MCP servers whose stubs come out wrong
+are all useful — the last one especially, because every server spells its
+schemas differently and only real ones prove the generator.
+
+`CONTRIBUTING.md` has the loop: `uv sync`, `uv run pytest`, `uv run pyright`,
+and the one rule that matters — `SPEC.md` is the source of truth, and its
+decisions are not revisited without saying so out loud.
+
+## Security
+
+Runlace executes Python written by a model, holds references to your tokens, and
+can call tools that act on the world. `SECURITY.md` says what is defended, what
+is explicitly not, and how to report something.
+
+Short version: run it as a user with the access you would give the agent, keep
+`runlace serve` on loopback, and read the confirm gate as a feature rather than
+a formality.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
