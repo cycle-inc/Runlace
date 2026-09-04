@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
 
@@ -38,6 +39,7 @@ from .model import (
     DEFAULT_TIMEOUT,
     Model,
     read_model,
+    unset_references,
     write_model,
 )
 from .paths import RunlacePaths, paths as runlace_paths
@@ -47,6 +49,11 @@ from .sync_cmd import format_broken, format_changes, run_sync
 from .typecheck import check_stubs
 
 OPEN_WEBUI_TOKEN_ENV = "OPEN_WEBUI_TOKEN"
+
+# `init` asks the model to say hello too, but on a short leash: a backend that
+# hangs must not hold a setup command for two minutes, and the answer is a
+# nice-to-have there -- init saves the model either way.
+INIT_PROBE_TIMEOUT = 20.0
 
 # Every command that re-discovers needs this, not just `serve`. A `${VAR}` is
 # resolved by whatever process opens the connection, so running `runlace remove`
@@ -105,6 +112,18 @@ def init(
     model_base_url: Annotated[
         str, typer.Option("--model-base-url", help="Where that model lives.")
     ] = DEFAULT_BASE_URL,
+    model_api_key: Annotated[
+        str | None,
+        typer.Option(
+            "--model-api-key",
+            help='Pass a reference, not the key itself: "${OPENROUTER_API_KEY}". '
+            "Only remote backends need one.",
+            show_default=False,
+        ),
+    ] = None,
+    model_timeout: Annotated[
+        float, typer.Option("--model-timeout", help="Seconds to wait for one completion.")
+    ] = DEFAULT_TIMEOUT,
     env_file: EnvFiles = None,
 ) -> None:
     """Set up ~/.runlace, discover your MCP servers, and generate typed stubs."""
@@ -129,7 +148,14 @@ def init(
     for warning in report.warnings:
         typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW)
 
-    _init_model(paths, model, model_base_url, assume_yes=yes)
+    _init_model(
+        paths,
+        model,
+        model_base_url,
+        api_key=model_api_key,
+        timeout=model_timeout,
+        assume_yes=yes,
+    )
 
     if verify:
         result = check_stubs(paths.types)
@@ -382,6 +408,12 @@ def serve(
         )
         raise typer.Exit(code=1)
     _load_env_files(env_file)
+    # Before the home check on purpose: this is about the environment this
+    # process was started with, which is the thing --env-file just fixed or did
+    # not. A home with no model.json says nothing here.
+    model = read_model(paths.model)
+    if model is not None:
+        _warn_unset(model)
     if not paths.db.exists():
         typer.secho(
             f"No Runlace home at {paths.home}. Run `runlace init` first.",
@@ -402,13 +434,23 @@ def serve(
 
 
 def _init_model(
-    paths: RunlacePaths, name: str | None, base_url: str, *, assume_yes: bool
+    paths: RunlacePaths,
+    name: str | None,
+    base_url: str,
+    *,
+    api_key: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    assume_yes: bool,
 ) -> None:
     """Offer to pick a model during init. Never blocks setting a home up.
 
     Skipping is fine: workflows that do not call `ctx.ai(...)` never need one,
     and `runlace model set` exists for later. What is not fine is finding out
     only when a workflow is refused, so a home without a model says so.
+
+    Unlike `model set`, a backend that does not answer is a warning here and not
+    a failure: init is where a home is created, and refusing to create one
+    because Ollama is not started yet would be the wrong trade.
     """
     if name is None:
         if assume_yes or read_model(paths.model) is not None:
@@ -427,11 +469,54 @@ def _init_model(
             )
             return
 
-    model = Model(base_url=base_url, model=name)
-    write_model(paths.model, model)
+    model = Model(
+        base_url=base_url,
+        model=name,
+        api_key=_model_key(api_key, "--model-api-key"),
+        timeout=timeout,
+    )
     typer.echo("")
+    if _hello(model, timeout=INIT_PROBE_TIMEOUT) is None:
+        typer.secho(
+            "Saved anyway. Fix it with `runlace model set` before a workflow "
+            "needs it.",
+            fg=typer.colors.YELLOW,
+        )
+    write_model(paths.model, model)
     typer.echo(f"Model: {model.model}  {model.base_url}")
     _describe(model)
+
+
+def _model_key(api_key: str | None, flag: str) -> str | None:
+    """Refuse a literal key. The file keeps the reference, the environment the value."""
+    if api_key and not _ENV_REF.search(api_key):
+        typer.secho(
+            str(
+                LiteralSecret(flag, '"${RUNLACE_MODEL_KEY}" (or any name you like)')
+            ).replace("config.json", "model.json"),
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    return api_key
+
+
+def _hello(model: Model, *, timeout: float | None = None) -> str | None:
+    """Ask the model one question. Returns its answer, or None having said why."""
+    typer.echo(f"Asking {model.model} at {model.base_url} to answer once...")
+    probe = model if timeout is None else replace(model, timeout=timeout)
+    try:
+        answer = asyncio.run(
+            complete(
+                probe.resolved(),
+                [{"role": "user", "content": "Reply with the single word: ready"}],
+            )
+        )
+    except (AiFailed, MissingEnvVars) as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        return None
+    typer.secho(f"  {answer.text.strip()[:80]}", fg=typer.colors.BRIGHT_BLACK)
+    return answer.text
 
 
 model_app = typer.Typer(
@@ -480,37 +565,19 @@ def model_set(
     """
     paths = _existing_home()
     _load_env_files(env_file)
-    if api_key and not _ENV_REF.search(api_key):
+    model = Model(
+        base_url=base_url,
+        model=name,
+        api_key=_model_key(api_key, "--api-key"),
+        timeout=timeout,
+    )
+    if check and _hello(model) is None:
         typer.secho(
-            str(
-                LiteralSecret(
-                    "--api-key", '"${RUNLACE_MODEL_KEY}" (or any name you like)'
-                )
-            ).replace("config.json", "model.json"),
-            fg=typer.colors.RED,
+            "Nothing was saved. Re-run with --no-check to save it anyway.",
+            fg=typer.colors.YELLOW,
             err=True,
         )
         raise typer.Exit(code=1)
-
-    model = Model(base_url=base_url, model=name, api_key=api_key, timeout=timeout)
-    if check:
-        typer.echo(f"Asking {name} at {base_url} to answer once...")
-        try:
-            answer = asyncio.run(
-                complete(
-                    model.resolved(),
-                    [{"role": "user", "content": "Reply with the single word: ready"}],
-                )
-            )
-        except (AiFailed, MissingEnvVars) as exc:
-            typer.secho(str(exc), fg=typer.colors.RED, err=True)
-            typer.secho(
-                "Nothing was saved. Re-run with --no-check to save it anyway.",
-                fg=typer.colors.YELLOW,
-                err=True,
-            )
-            raise typer.Exit(code=1) from exc
-        typer.secho(f"  {answer.text.strip()[:80]}", fg=typer.colors.BRIGHT_BLACK)
 
     write_model(paths.model, model)
     typer.echo(f"Saved to {paths.model}")
@@ -545,6 +612,26 @@ def _describe(model: Model) -> None:
     if model.api_key:
         # The reference, deliberately -- the value is only ever in the environment.
         typer.echo(f"  key: {model.api_key}")
+    _warn_unset(model)
+
+
+def _warn_unset(model: Model) -> None:
+    """Say now what would otherwise fail halfway through a run.
+
+    A `ctx.ai` step resolves the key when the workflow reaches it, which can be
+    after a step that already sent something. The variable is set -- or not --
+    in the process running the server, so that is where this has to be said.
+
+    On stderr, because `serve` calls it and stdio is the transport there.
+    """
+    unset = unset_references(model)
+    if unset:
+        typer.secho(
+            f"  not set right now: {', '.join(unset)}. Export it, or pass "
+            "--env-file to `runlace serve`, or ctx.ai steps fail mid-run.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
 
 
 def _existing_home() -> RunlacePaths:

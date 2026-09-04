@@ -26,6 +26,7 @@ from runlace.model import (
     DEFAULT_TIMEOUT,
     Model,
     read_model,
+    unset_references,
     write_model,
 )
 
@@ -122,6 +123,15 @@ def test_the_key_stays_a_reference_on_disk(tmp_path: Path) -> None:
     assert resolved.resolved({"SOME_KEY": "sk-real"}).api_key == "sk-real"
     with pytest.raises(MissingEnvVars):
         resolved.resolved({})
+
+
+def test_the_variables_a_model_needs_can_be_checked_without_calling_it() -> None:
+    """`serve` asks this at startup, so it cannot cost a request."""
+    model = Model(base_url="${AI_HOST}/v1", model="m", api_key="${SOME_KEY}")
+
+    assert unset_references(model, {}) == ["AI_HOST", "SOME_KEY"]
+    assert unset_references(model, {"AI_HOST": "http://x", "SOME_KEY": "k"}) == []
+    assert unset_references(Model(base_url="http://x/v1", model="m"), {}) == []
 
 
 def test_a_default_timeout_is_not_written_out(tmp_path: Path) -> None:

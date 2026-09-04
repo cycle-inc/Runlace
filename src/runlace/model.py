@@ -105,6 +105,21 @@ class Model:
         return expanded
 
 
+def unset_references(model: Model, environ: Mapping[str, str] | None = None) -> list[str]:
+    """The ``${VAR}`` names this model refers to that have no value right now.
+
+    Worth saying at configuration time rather than at call time: a ``ctx.ai``
+    step resolves the key when the workflow reaches it, which can be after a
+    step that already sent an email. "Not set" is a setup problem and belongs
+    where the setup happens.
+    """
+    try:
+        model.resolved(environ)
+    except MissingEnvVars as exc:
+        return exc.names
+    return []
+
+
 def read_model(path: Path) -> Model | None:
     """The configured model, or None if there is not one.
 

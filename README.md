@@ -371,11 +371,24 @@ runlace model set gpt-4o-mini \
   --base-url https://api.openai.com/v1 \
   --api-key '${OPENAI_API_KEY}'                   # expanded at run time, never stored
 runlace model show
+
+runlace init --from ~/.config/mcp.json \          # or all of it in one command
+  --model anthropic/claude-sonnet-4.5 \
+  --model-base-url https://openrouter.ai/api/v1 \
+  --model-api-key '${OPENROUTER_API_KEY}'
 ```
 
-`model set` asks the model one question before saving, so a backend that is down
+Both ask the model one question before you rely on it, so a backend that is down
 or a model that was never pulled is a problem you have at configuration time
-rather than three minutes into a run.
+rather than three minutes into a run. `model set` refuses to save on a failed
+hello; `init` saves anyway and says so, because a home should still get created
+when Ollama is not started yet.
+
+A key is a `${VAR}` reference or it is refused: the file keeps the reference and
+the environment keeps the value. The variable is read when a step reaches it,
+so `model show` and `runlace serve` both say up front when it is not set --
+otherwise you learn it mid-run, after the step before it has already sent
+something.
 
 With a `schema` the answer is validated locally against it -- the same Pydantic
 path as every other schema here -- and comes back as a dict; a model that

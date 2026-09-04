@@ -32,9 +32,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from .ai import Answer
+from .ai import AiFailed, Answer
 from .ai import answer as ask_model
-from .config import Connector, read_config
+from .config import Connector, MissingEnvVars, read_config
 from .db import (
     Connection,
     enqueue_run,
@@ -678,9 +678,18 @@ def _asking(model: Model) -> Ask:
     """
 
     async def ask(system: str, user: str, schema: dict[str, Any] | None) -> Answer:
-        return await ask_model(
-            model.resolved(), system=system, user=user, schema=schema
-        )
+        try:
+            resolved = model.resolved()
+        except MissingEnvVars as exc:
+            # Not the raw exception: by the time a step reaches this, earlier
+            # steps have already acted, and the reader needs the fix and not
+            # the class name.
+            raise AiFailed(
+                f"the model `{model.model}` needs {', '.join(exc.names)}, and it "
+                "is not set where Runlace is running. Export it, or pass "
+                "--env-file to `runlace serve`."
+            ) from exc
+        return await ask_model(resolved, system=system, user=user, schema=schema)
 
     return ask
 

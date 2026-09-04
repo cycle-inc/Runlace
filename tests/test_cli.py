@@ -10,9 +10,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
-from runlace.cli import app
+from runlace.cli import _init_model, app
+from runlace.paths import RunlacePaths
 
 runner = CliRunner()
 
@@ -134,3 +136,84 @@ def test_a_model_that_does_not_answer_is_not_saved(home: Path) -> None:
     assert result.exit_code == 1
     assert not (home / "model.json").exists()
     assert "--no-check" in result.output
+
+
+def test_a_key_that_is_not_set_is_said_at_configuration_time(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise it is said mid-run, after the steps before it have acted."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    result = runner.invoke(
+        app,
+        ["model", "set", "gpt-4o-mini", "--base-url", "https://openrouter.ai/api/v1",
+         "--api-key", "${OPENROUTER_API_KEY}", "--no-check"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "OPENROUTER_API_KEY" in result.output
+    assert "--env-file" in result.output
+
+
+def test_serve_says_it_before_a_host_connects(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`serve` is where the environment is decided, so it is where this belongs."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    runner.invoke(
+        app,
+        ["model", "set", "gpt-4o-mini", "--base-url", "https://openrouter.ai/api/v1",
+         "--api-key", "${OPENROUTER_API_KEY}", "--no-check"],
+    )
+
+    # No database, so this stops right after the warning -- which is the point:
+    # it comes before anything is served.
+    result = runner.invoke(app, ["serve"])
+
+    assert "OPENROUTER_API_KEY" in result.output
+
+
+def test_init_configures_a_keyed_remote_model_in_one_command(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A remote backend needs a key, so `init` has to be able to take one."""
+    assert "--model-api-key" in runner.invoke(app, ["init", "--help"]).output
+
+    # Nothing is listening on port 1: the hello fails, and init saves anyway.
+    _init_model(
+        RunlacePaths(home),
+        "gpt-4o-mini",
+        "http://127.0.0.1:1/v1",
+        api_key="${OPENROUTER_API_KEY}",
+        assume_yes=True,
+    )
+
+    saved = (home / "model.json").read_text(encoding="utf-8")
+    assert '"api_key": "${OPENROUTER_API_KEY}"' in saved
+    assert "Saved anyway" in capsys.readouterr().out
+
+
+def test_init_refuses_a_literal_key_as_firmly_as_model_set(home: Path) -> None:
+    with pytest.raises(typer.Exit):
+        _init_model(
+            RunlacePaths(home),
+            "gpt-4o-mini",
+            "https://openrouter.ai/api/v1",
+            api_key="sk-live-abcdef",
+            assume_yes=True,
+        )
+
+    assert not (home / "model.json").exists()
+
+
+def test_a_set_key_says_nothing(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A warning that fires on a working setup is a warning people stop reading."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-whatever")
+
+    result = runner.invoke(
+        app,
+        ["model", "set", "gpt-4o-mini", "--base-url", "https://openrouter.ai/api/v1",
+         "--api-key", "${OPENROUTER_API_KEY}", "--no-check"],
+    )
+
+    assert "not set right now" not in result.output

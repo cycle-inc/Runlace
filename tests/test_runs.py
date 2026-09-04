@@ -882,6 +882,32 @@ def test_a_simulated_bridge_without_a_schema_still_answers_a_string(
     assert isinstance(asyncio.run(invent()).value, str)
 
 
+def test_a_key_that_is_not_set_fails_the_step_with_the_fix_in_it(
+    paths: RunlacePaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """By now earlier steps have acted. The reader needs the fix, not the class name."""
+    monkeypatch.delenv("RUNLACE_MODEL_KEY", raising=False)
+    write_model(
+        paths.model,
+        Model(
+            base_url="https://openrouter.ai/api/v1",
+            model="gpt-4o-mini",
+            api_key="${RUNLACE_MODEL_KEY}",
+        ),
+    )
+    bridge = _ai_bridge(paths, None, risk="side_effect")
+    assert bridge is not None
+
+    async def ask() -> Answer:
+        return await bridge.ask("s", "u", None)
+
+    with pytest.raises(AiFailed) as failure:
+        asyncio.run(ask())
+
+    assert "RUNLACE_MODEL_KEY" in str(failure.value)
+    assert "--env-file" in str(failure.value)
+
+
 # -- the gates, when the model is somewhere else ---------------------------
 
 REMOTE = "https://api.openai.com/v1"
