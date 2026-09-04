@@ -26,8 +26,10 @@ from time import perf_counter
 from typing import Any, Awaitable, Callable
 
 from . import runner_shim
+from .ai import AiFailed, Answer
 from .db import Connection, find_tool_by_method
 from .keys import to_json_keys, to_python_keys
+from .risk import READ_ONLY
 
 RUNNER_FILENAME = "_runlace_runner.py"
 WORKFLOW_FILENAME = "workflow.py"
@@ -55,6 +57,23 @@ class ToolFailed(Exception):
 # (connector name, verbatim tool name, arguments) -> whatever the tool returned.
 CallTool = Callable[[str, str, dict[str, Any]], Awaitable[Any]]
 
+# (system, user, schema) -> the answer and its token counts.
+Ask = Callable[[str, str, dict[str, Any] | None], Awaitable[Answer]]
+
+
+@dataclass(frozen=True)
+class AiBridge:
+    """What `ctx.ai(...)` reaches, and what a run may spend on it.
+
+    Injected for the same reason ``call_tool`` is: this module must stay the
+    one that knows how to serve the child, and not the one that knows what a
+    model is. ``risk`` travels with it because a step row needs one even when
+    the call fails, and only the caller knows how far away the model is.
+    """
+
+    ask: Ask
+    risk: str = READ_ONLY
+
 
 @dataclass(frozen=True)
 class Step:
@@ -69,6 +88,8 @@ class Step:
     status: str
     duration_ms: int
     error: str | None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
 
     def to_json(self) -> dict[str, Any]:
         """What `run_workflow` reports.
@@ -78,7 +99,7 @@ class Step:
         which is where a debug trace belongs, and ``get_step`` reads one back
         when an agent genuinely needs to see the shape of what came out.
         """
-        return {
+        reported = {
             "seq": self.seq,
             "connector": self.connector,
             "tool": self.tool,
@@ -87,6 +108,11 @@ class Step:
             "duration_ms": self.duration_ms,
             "error": self.error,
         }
+        # Only where there were any. A `"tokens": null` on every tool step
+        # would suggest the question means something there.
+        if self.tokens_in is not None or self.tokens_out is not None:
+            reported["tokens"] = {"in": self.tokens_in, "out": self.tokens_out}
+        return reported
 
 
 @dataclass
@@ -113,6 +139,7 @@ async def run_code(
     code: str,
     inputs: dict[str, Any],
     call_tool: CallTool,
+    ai: AiBridge | None = None,
     on_step: Callable[[Step], None] | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> Outcome:
@@ -144,6 +171,7 @@ async def run_code(
             process,
             conn,
             call_tool=call_tool,
+            ai=ai,
             steps=steps,
             on_step=on_step,
             timeout=timeout,
@@ -165,6 +193,7 @@ async def _serve(
     conn: Connection,
     *,
     call_tool: CallTool,
+    ai: AiBridge | None,
     steps: list[Step],
     on_step: Callable[[Step], None] | None,
     timeout: float,
@@ -208,7 +237,12 @@ async def _serve(
                 )
 
             response = await _respond(
-                message, conn, call_tool=call_tool, steps=steps, on_step=on_step
+                message,
+                conn,
+                call_tool=call_tool,
+                ai=ai,
+                steps=steps,
+                on_step=on_step,
             )
             process.stdin.write((json.dumps(response) + "\n").encode("utf-8"))
             await process.stdin.drain()
@@ -265,10 +299,11 @@ async def _respond(
     conn: Connection,
     *,
     call_tool: CallTool,
+    ai: AiBridge | None,
     steps: list[Step],
     on_step: Callable[[Step], None] | None,
 ) -> dict[str, Any]:
-    """Perform one requested tool call and build the JSON-RPC reply."""
+    """Perform one requested call and build the JSON-RPC reply."""
     request_id = message.get("id")
     if message.get("method") != runner_shim.METHOD_CALL_TOOL:
         return _error(request_id, f"unsupported request `{message.get('method')}`")
@@ -279,6 +314,11 @@ async def _respond(
     arguments = params.get("arguments")
     if not isinstance(arguments, dict):
         arguments = {}
+
+    if attr == runner_shim.AI_CONNECTOR:
+        return await _respond_ai(
+            request_id, arguments, ai=ai, steps=steps, on_step=on_step
+        )
 
     row = find_tool_by_method(conn, attr, method)
     if row is None:
@@ -323,6 +363,67 @@ async def _respond(
     # promised, so `from` becomes `from_` again on the way in.
     answer = to_python_keys(result, _schema(row["output_schema_json"]))
     return {"jsonrpc": "2.0", "id": request_id, "result": answer}
+
+
+async def _respond_ai(
+    request_id: Any,
+    arguments: dict[str, Any],
+    *,
+    ai: AiBridge | None,
+    steps: list[Step],
+    on_step: Callable[[Step], None] | None,
+) -> dict[str, Any]:
+    """Ask the model, journal the exchange, answer the child.
+
+    Deliberately the same shape as a tool call: an AI step is a step, and a
+    failure here fails the run exactly as a broken connector would.
+    """
+    schema = arguments.get("schema")
+    payload = {
+        "system": str(arguments.get("system", "")),
+        "user": str(arguments.get("user", "")),
+        "schema": schema if isinstance(schema, dict) else None,
+    }
+
+    if ai is None:
+        # Reachable when the model was removed after the workflow was created:
+        # create_workflow refuses `ctx.ai` with no model configured.
+        return _error(
+            request_id,
+            "ctx.ai: no model is configured on this machine. Ask whoever runs "
+            "Runlace for `runlace model set <name>`.",
+        )
+
+    started = perf_counter()
+    answer: Answer | None = None
+    error: str | None = None
+    try:
+        answer = await ai.ask(payload["system"], payload["user"], payload["schema"])
+    except AiFailed as exc:
+        error = str(exc)
+    except Exception as exc:  # noqa: BLE001 - a model that misbehaves fails the step
+        error = f"{type(exc).__name__}: {exc}"
+
+    step = Step(
+        seq=len(steps) + 1,
+        connector=runner_shim.AI_CONNECTOR,
+        tool=runner_shim.AI_TOOL,
+        risk=ai.risk,
+        payload=payload,
+        result=answer.value if answer else None,
+        status=STEP_ERROR if error else STEP_OK,
+        duration_ms=int((perf_counter() - started) * 1000),
+        error=error,
+        tokens_in=answer.tokens_in if answer else None,
+        tokens_out=answer.tokens_out if answer else None,
+    )
+    steps.append(step)
+    if on_step is not None:
+        on_step(step)
+
+    if error is not None or answer is None:
+        return _error(request_id, f"ctx.ai: {error}")
+    return {"jsonrpc": "2.0", "id": request_id, "result": answer.value}
 
 
 def _schema(column: Any) -> dict[str, Any] | None:

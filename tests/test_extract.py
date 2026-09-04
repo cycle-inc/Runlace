@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from runlace.extract import extract_tool_calls, unique_tools
+from runlace.extract import extract_ai_calls, extract_tool_calls, unique_tools
 
 
 def test_no_tool_calls() -> None:
@@ -103,3 +103,59 @@ def test_attribute_calls_on_other_objects_are_ignored() -> None:
         "    return {'n': text.count('a')}\n"
     )
     assert extract_tool_calls(code) == []
+
+
+# -- ctx.ai ----------------------------------------------------------------
+
+
+def test_an_ai_call_is_found_with_its_line() -> None:
+    code = (
+        "def run(ctx):\n"
+        "    verdict = ctx.ai(system='judge', user='is this spam?')\n"
+        "    return {'verdict': verdict}\n"
+    )
+    calls = extract_ai_calls(code)
+    assert [(c.line, c.schema, c.literal) for c in calls] == [(2, None, False)]
+
+
+def test_a_literal_schema_comes_back_with_the_call() -> None:
+    """The compiler refuses a schema it cannot make sense of, so it needs the value."""
+    code = (
+        "def run(ctx):\n"
+        "    return ctx.ai(\n"
+        "        system='judge',\n"
+        "        user='is this spam?',\n"
+        "        schema={'type': 'object', 'properties': {'spam': {'type': 'boolean'}}},\n"
+        "    )\n"
+    )
+    (call,) = extract_ai_calls(code)
+    assert call.literal
+    assert call.schema == {
+        "type": "object",
+        "properties": {"spam": {"type": "boolean"}},
+    }
+
+
+def test_a_schema_built_at_run_time_is_reported_as_not_literal() -> None:
+    """Nothing to check at create time; validation still happens at run time."""
+    code = (
+        "def run(ctx):\n"
+        "    shape = {'type': 'object', 'properties': {'n': {'type': 'integer'}}}\n"
+        "    return ctx.ai(system='s', user='u', schema=shape)\n"
+    )
+    (call,) = extract_ai_calls(code)
+    assert (call.schema, call.literal) == (None, False)
+
+
+def test_ctx_ai_is_not_reported_as_a_connector() -> None:
+    code = "def run(ctx):\n    return {'x': ctx.ai(system='s', user='u')}\n"
+    assert extract_tool_calls(code) == []
+
+
+def test_an_attribute_call_on_something_else_named_ai_is_ignored() -> None:
+    code = (
+        "def run(ctx):\n"
+        "    ai = ctx.inputs\n"
+        "    return {'x': ai.get('x')}\n"
+    )
+    assert extract_ai_calls(code) == []

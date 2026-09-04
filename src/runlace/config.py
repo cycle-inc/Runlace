@@ -154,11 +154,23 @@ def _str_map(value: Any) -> dict[str, str]:
     return {str(k): str(v) for k, v in value.items()}
 
 
+# `ctx` already has these, and they are not connectors. A server that took one
+# of the names would be unreachable from a workflow anyway -- `ctx.ai` and
+# `ctx.inputs` are set on the object, so `__getattr__` never runs for them --
+# and the stub file would declare the attribute twice. Better to say so at
+# import time than to let someone wonder why their server never answers.
+RESERVED_ATTRS = frozenset({"ai", "inputs"})
+
+
 def parse_entry(name: str, entry: dict[str, Any]) -> tuple[Connector | None, str | None]:
     """Normalise one ``mcpServers`` entry. Returns ``(connector, warning)``."""
     attr = python_identifier(name)
     if attr is None:
         return None, f"{name}: cannot be spelled as a Python attribute, skipped"
+    if attr in RESERVED_ATTRS:
+        return None, (
+            f"{name}: `ctx.{attr}` is Runlace's own, a server cannot take it, skipped"
+        )
 
     transport = _transport_of(entry)
     if transport is None:

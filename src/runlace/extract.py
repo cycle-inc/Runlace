@@ -15,7 +15,9 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 
-from .lint import CTX_PARAM, INPUTS_ATTR
+from typing import Any
+
+from .lint import AI_ATTR, CTX_PARAM, INPUTS_ATTR
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,21 @@ class ToolCall:
     connector: str
     method: str
     line: int
+
+
+@dataclass(frozen=True)
+class AiCall:
+    """One `ctx.ai(...)` call site.
+
+    ``schema`` is the literal passed as ``schema=``, when it was written as a
+    literal -- which is the usual case and the only one worth checking at
+    create time. ``None`` covers both "no schema" and "a schema built at run
+    time"; ``literal`` tells them apart.
+    """
+
+    line: int
+    schema: Any = None
+    literal: bool = False
 
 
 def extract_tool_calls(code: str) -> list[ToolCall]:
@@ -64,6 +81,42 @@ def extract_tool_calls(code: str) -> list[ToolCall]:
         )
     calls.sort(key=lambda c: (c.line, c.connector, c.method))
     return calls
+
+
+def extract_ai_calls(code: str) -> list[AiCall]:
+    """Return every `ctx.ai(...)` call site, in source order.
+
+    A different AST shape from a tool call -- one attribute deep rather than
+    two -- so it is walked separately rather than folded into
+    :func:`extract_tool_calls`, whose result feeds tool resolution against the
+    database. There is no database row for the model.
+    """
+    tree = ast.parse(code)
+    calls: list[AiCall] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != AI_ATTR:
+            continue
+        if not (isinstance(func.value, ast.Name) and func.value.id == CTX_PARAM):
+            continue
+        calls.append(AiCall(line=node.lineno, **_schema_argument(node)))
+    calls.sort(key=lambda c: c.line)
+    return calls
+
+
+def _schema_argument(node: ast.Call) -> dict[str, Any]:
+    for keyword in node.keywords:
+        if keyword.arg != "schema":
+            continue
+        try:
+            return {"schema": ast.literal_eval(keyword.value), "literal": True}
+        except ValueError:
+            # Built from a name, a call, an f-string: legal, just not readable
+            # from here. Run-time validation still applies to whatever it is.
+            return {"schema": None, "literal": False}
+    return {"schema": None, "literal": False}
 
 
 def unique_tools(calls: list[ToolCall]) -> list[tuple[str, str]]:

@@ -32,6 +32,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from .ai import Answer
+from .ai import answer as ask_model
 from .config import Connector, read_config
 from .db import (
     Connection,
@@ -44,8 +46,10 @@ from .db import (
     tool_output_schemas,
 )
 from .journal import get_run as read_run
+from .model import Model, read_model
 from .paths import RunlacePaths
 from .policy import Policy, read_policy
+from .risk import READ_ONLY, SIDE_EFFECT
 from .queue import (
     APPROVAL_ASK,
     AWAITING_APPROVAL,
@@ -58,6 +62,8 @@ from .runner import (
     DEFAULT_TIMEOUT_SECONDS,
     STATUS_COMPLETED,
     STATUS_FAILED,
+    AiBridge,
+    Ask,
     CallTool,
     Step,
     run_code,
@@ -127,6 +133,7 @@ async def run_workflow(
     version: str | None = None,
     dry_run: bool = False,
     call_tool: CallTool | None = None,
+    ask: Ask | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     wait: float | None = None,
     approval: str = APPROVAL_ASK,
@@ -160,9 +167,10 @@ async def run_workflow(
     ``call_tool`` is injectable so tests can run a real subprocess against fake
     tools. Left unset, sessions are opened to the connectors the workflow uses;
     it also forces the inline path, because a worker in another process has no
-    way to be handed a Python callable.
+    way to be handed a Python callable. ``ask`` is the same arrangement for
+    `ctx.ai`, and forces the inline path for the same reason.
     """
-    handed_over = call_tool is None and has_live_worker(conn)
+    handed_over = call_tool is None and ask is None and has_live_worker(conn)
     admission = admit(
         conn,
         paths,
@@ -178,7 +186,7 @@ async def run_workflow(
         return admission.result
     if not handed_over:
         result = await execute(
-            conn, paths, admission, call_tool=call_tool, timeout=timeout
+            conn, paths, admission, call_tool=call_tool, ask=ask, timeout=timeout
         )
         return {**result, "executed": EXECUTED_INLINE}
     return await _wait_for(conn, admission, wait)
@@ -320,6 +328,7 @@ async def execute(
     admitted: Admitted,
     *,
     call_tool: CallTool | None = None,
+    ask: Ask | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Run an admitted workflow to the end and journal it. Steps 4 and 5.
@@ -372,10 +381,13 @@ async def execute(
             status=step.status,
             duration_ms=step.duration_ms,
             error=step.error,
+            tokens_in=step.tokens_in,
+            tokens_out=step.tokens_out,
         )
         conn.commit()
 
     stand_ins = _stand_ins(conn, simulated) if dry_run else {}
+    ai = _ai_bridge(paths, ask)
 
     if call_tool is not None:
         outcome = await run_code(
@@ -383,6 +395,7 @@ async def execute(
             code=code,
             inputs=resolved,
             call_tool=_without_side_effects(call_tool, stand_ins),
+            ai=ai,
             on_step=journal,
             timeout=timeout,
         )
@@ -394,6 +407,7 @@ async def execute(
                     code=code,
                     inputs=resolved,
                     call_tool=_without_side_effects(sessions.call, stand_ins),
+                    ai=ai,
                     on_step=journal,
                     timeout=timeout,
                 )
@@ -599,6 +613,51 @@ def _unfinished(conn: Connection, admitted: Admitted) -> dict[str, Any]:
         "output": None,
         "steps": [],
     }
+
+
+def _ai_bridge(paths: RunlacePaths, ask: Ask | None) -> AiBridge | None:
+    """What `ctx.ai(...)` reaches during this run, if anything.
+
+    ``None`` when no model is configured -- `create_workflow` refuses a
+    workflow that calls `ctx.ai` in that state, so this only happens when the
+    model was removed afterwards, and the step says so rather than the run
+    failing somewhere less obvious.
+
+    ``ask`` is injectable for the same reason ``call_tool`` is; a fake model is
+    treated as local, because a fake sends nothing anywhere.
+    """
+    model = read_model(paths.model)
+    if ask is None:
+        if model is None:
+            return None
+        ask = _asking(model)
+    return AiBridge(ask=ask, risk=ai_risk(model))
+
+
+def _asking(model: Model) -> Ask:
+    """Bind the configured model into the shape the runner injects.
+
+    ``${VAR}`` is expanded here, one call at a time, rather than when the file
+    was read: a key exported after the daemon started should work, and a key
+    that is missing should fail the step with a message naming it.
+    """
+
+    async def ask(system: str, user: str, schema: dict[str, Any] | None) -> Answer:
+        return await ask_model(
+            model.resolved(), system=system, user=user, schema=schema
+        )
+
+    return ask
+
+
+def ai_risk(model: Model | None) -> str:
+    """How risky it is to reach this model. Distance decides.
+
+    A model on this machine has sent nothing anywhere, so an AI step against it
+    is a read. A remote one hands the run's data to somebody else, which is a
+    side effect whatever it does with it afterwards.
+    """
+    return READ_ONLY if model is None or model.is_local else SIDE_EFFECT
 
 
 def side_effects_of(policy: Policy, record: dict[str, Any]) -> list[dict[str, Any]]:

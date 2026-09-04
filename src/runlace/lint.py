@@ -70,6 +70,11 @@ RUN_FUNCTION = "run"
 # call to a connector named `inputs`.
 INPUTS_ATTR = "inputs"
 
+# The other `ctx` attribute that is not a connector: `ctx.ai(system=..., user=...)`
+# asks the configured model a question. One attribute deep, not two, because
+# there is exactly one thing to do with a model and no server to name.
+AI_ATTR = "ai"
+
 E_SYNTAX = "syntax-error"
 E_FORBIDDEN_IMPORT = "forbidden-import"
 E_IMPORT_NOT_ALLOWED = "import-not-allowed"
@@ -568,6 +573,9 @@ class _Checker:
         """`ctx.<connector>` must continue into `.<tool>(...)`."""
         if connector_access.attr == INPUTS_ATTR:
             return
+        if connector_access.attr == AI_ATTR:
+            self._check_ai_is_called(connector_access)
+            return
         if connector_access.attr.startswith("__"):
             # `ctx.__dict__` and friends are already reported as dunder access.
             return
@@ -608,6 +616,24 @@ class _Checker:
                 f"called, not referenced",
                 f"Write `{CTX_PARAM}.{connector_access.attr}.{tool_access.attr}(...)`. "
                 f"Tools cannot be assigned to variables.",
+            )
+
+    def _check_ai_is_called(self, ai_access: ast.Attribute) -> None:
+        """`ctx.ai` has to be called on the spot, for the same reason a tool does.
+
+        Extraction reads AI steps off the source too -- a workflow reaching a
+        model is a fact the gates need before anything runs -- and a `ctx.ai`
+        handed to another function is a call site nothing can see.
+        """
+        call = self.parents.get(ai_access)
+        if not (isinstance(call, ast.Call) and call.func is ai_access):
+            self.add(
+                ai_access,
+                E_CTX_TOOL_NOT_CALLED,
+                f"`{CTX_PARAM}.{AI_ATTR}` must be called, not referenced",
+                f"Write `{CTX_PARAM}.{AI_ATTR}(system=..., user=..., "
+                f"schema=...)` where you need the answer. It cannot be stored "
+                f"in a variable or passed to another function.",
             )
 
     # -- what the connector index buys the hints -------------------------

@@ -106,6 +106,30 @@ def test_private_attributes_are_not_connectors() -> None:
         _ = ctx._channel.anything  # type: ignore[attr-defined]
 
 
+def test_ctx_ai_travels_the_same_pipe_under_a_reserved_name() -> None:
+    channel = FakeChannel(answers=[{"urgent": True}])
+    ctx = Ctx(channel, {})  # type: ignore[arg-type]
+
+    schema = {"type": "object", "properties": {"urgent": {"type": "boolean"}}}
+    assert ctx.ai(system="s", user="u", schema=schema) == {"urgent": True}
+    assert channel.calls == [
+        ("ai", "complete", {"system": "s", "user": "u", "schema": schema})
+    ]
+
+
+def test_ctx_ai_without_a_schema_sends_no_schema() -> None:
+    channel = FakeChannel(answers=["yes"])
+    ctx = Ctx(channel, {})  # type: ignore[arg-type]
+    assert ctx.ai(system="s", user="u") == "yes"
+    assert channel.calls == [("ai", "complete", {"system": "s", "user": "u"})]
+
+
+def test_ctx_ai_is_a_callable_and_not_a_connector() -> None:
+    """A server named `ai` could not shadow it: `__getattr__` never sees the name."""
+    ctx = Ctx(FakeChannel(), {})  # type: ignore[arg-type]
+    assert repr(ctx.ai) == "<ctx.ai>"
+
+
 # -- the channel -----------------------------------------------------------
 
 

@@ -114,7 +114,7 @@ def _whose_run(conn: Connection, row: Any) -> dict[str, Any]:
 
 def _step_summary(step: Any) -> dict[str, Any]:
     """The same seven fields ``run_workflow`` reports, read back off the journal."""
-    return {
+    summary = {
         "seq": int(step["seq"]),
         "connector": str(step["connector"]),
         "tool": str(step["tool"]),
@@ -123,6 +123,23 @@ def _step_summary(step: Any) -> dict[str, Any]:
         "duration_ms": step["duration_ms"],
         "error": step["error"],
     }
+    tokens = _tokens(step)
+    if tokens is not None:
+        summary["tokens"] = tokens
+    return summary
+
+
+def _tokens(row: Any) -> dict[str, Any] | None:
+    """What an AI step cost, or ``None`` for anything that cost no tokens.
+
+    Absent rather than zero on a tool call, and absent rather than zero on a
+    backend that reports no usage: "not measured" and "free" are different
+    facts and a reader should not have to guess which one a 0 means.
+    """
+    tokens_in, tokens_out = row["tokens_in"], row["tokens_out"]
+    if tokens_in is None and tokens_out is None:
+        return None
+    return {"in": tokens_in, "out": tokens_out}
 
 
 def get_step(conn: Connection, run_id: str, seq: int) -> dict[str, Any]:
@@ -136,6 +153,7 @@ def get_step(conn: Connection, run_id: str, seq: int) -> dict[str, Any]:
     if len(row["payload_json"] or "") > PAYLOAD_BUDGET:
         payload = _trim(payload, "payload", notes)
     result = _trim(_decode(row["result_json"]), "result", notes)
+    tokens = _tokens(row)
 
     return {
         "ok": True,
@@ -147,6 +165,7 @@ def get_step(conn: Connection, run_id: str, seq: int) -> dict[str, Any]:
         "status": str(row["status"]),
         "duration_ms": row["duration_ms"],
         "error": row["error"],
+        **({"tokens": tokens} if tokens is not None else {}),
         "payload": payload,
         "result": result,
         # What the tool actually returned, before trimming. A step whose result

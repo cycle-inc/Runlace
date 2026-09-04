@@ -138,6 +138,16 @@ MIGRATIONS = [
     # `policy.yaml` may have been edited in between and the human said yes to
     # the list they were shown, not to whatever the file says an hour later.
     "ALTER TABLE runs ADD COLUMN side_effects_json TEXT",
+    # v7 (M10): AI steps. Cost is the first question anyone asks about a
+    # workflow that calls a model, and the journal is the only place that can
+    # answer it. NULL for a tool step, and also for a backend that does not
+    # report usage -- which is not the same as a call having been free.
+    "ALTER TABLE steps ADD COLUMN tokens_in INTEGER",
+    "ALTER TABLE steps ADD COLUMN tokens_out INTEGER",
+    # Whether this version calls `ctx.ai(...)`. Read off the code at compile
+    # time, like `tools_used`, and stored for the same reason: the gates need
+    # to know a run will reach a model without parsing Python to find out.
+    "ALTER TABLE workflow_versions ADD COLUMN uses_ai INTEGER NOT NULL DEFAULT 0",
 ]
 
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
@@ -321,14 +331,15 @@ def insert_workflow_version(
     inputs_schema: dict[str, Any] | None,
     outputs_schema: dict[str, Any] | None,
     tools_used: list[dict[str, Any]],
+    uses_ai: bool = False,
 ) -> None:
     """Add a version. Versions are immutable: nothing ever updates this row."""
     conn.execute(
         """
         INSERT INTO workflow_versions(id, workflow_id, version_hash, file_path,
                                       inputs_schema_json, outputs_schema_json,
-                                      tools_used_json, created_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                                      tools_used_json, created_at, uses_ai)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             version_id,
@@ -339,6 +350,7 @@ def insert_workflow_version(
             canonical_json(outputs_schema) if outputs_schema is not None else None,
             canonical_json(tools_used),
             now_iso(),
+            int(uses_ai),
         ),
     )
     conn.execute(
@@ -652,12 +664,15 @@ def insert_step(
     status: str,
     duration_ms: int,
     error: str | None,
+    tokens_in: int | None = None,
+    tokens_out: int | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO steps(id, run_id, seq, connector, tool, risk, payload_json,
-                          result_json, status, duration_ms, error)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          result_json, status, duration_ms, error,
+                          tokens_in, tokens_out)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             step_id,
@@ -671,6 +686,8 @@ def insert_step(
             status,
             duration_ms,
             error,
+            tokens_in,
+            tokens_out,
         ),
     )
 

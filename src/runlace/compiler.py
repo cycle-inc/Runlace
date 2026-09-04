@@ -25,8 +25,9 @@ from pathlib import Path
 from typing import Any
 
 from .db import Connection, method_index
-from .extract import ToolCall, extract_tool_calls
+from .extract import AiCall, ToolCall, extract_ai_calls, extract_tool_calls
 from .lint import lint
+from .model import Model
 from .naming import python_identifier
 from .stubs import WORKFLOW_TYPES_STUB, render_workflow_types
 from .typecheck import Diagnostic, check_paths
@@ -87,6 +88,7 @@ class CompileResult:
     errors: list[CompileError] = field(default_factory=list[CompileError])
     tools_used: list[PinnedTool] = field(default_factory=list[PinnedTool])
     warnings: list[str] = field(default_factory=list[str])
+    uses_ai: bool = False
 
     @property
     def has_side_effects(self) -> bool:
@@ -101,6 +103,7 @@ def compile_workflow(
     code: str,
     inputs_schema: dict[str, Any] | None,
     outputs_schema: dict[str, Any] | None = None,
+    model: Model | None = None,
 ) -> CompileResult:
     """Run the D3 pipeline. Never raises for bad input; it returns a verdict."""
     lint_errors = lint(
@@ -128,7 +131,7 @@ def compile_workflow(
     if typecheck_errors:
         return CompileResult(ok=False, stage=STAGE_TYPECHECK, errors=typecheck_errors)
 
-    return _extract_and_pin(conn, code)
+    return _extract_and_pin(conn, code, model)
 
 
 # -- stage 2 ---------------------------------------------------------------
@@ -285,8 +288,11 @@ def _typecheck_hint(rule: str | None, message: str) -> str:
 # -- stages 3 and 4 --------------------------------------------------------
 
 
-def _extract_and_pin(conn: Connection, code: str) -> CompileResult:
+def _extract_and_pin(
+    conn: Connection, code: str, model: Model | None = None
+) -> CompileResult:
     calls = extract_tool_calls(code)
+    ai_calls = extract_ai_calls(code)
     lines_by_pair: dict[tuple[str, str], list[int]] = defaultdict(list)
     for call in calls:
         lines_by_pair[(call.connector, call.method)].append(call.line)
@@ -295,7 +301,7 @@ def _extract_and_pin(conn: Connection, code: str) -> CompileResult:
         str(row["attr"]) for row in conn.execute("SELECT attr FROM connectors")
     }
 
-    errors: list[CompileError] = []
+    errors: list[CompileError] = _ai_errors(ai_calls, model)
     pinned: list[PinnedTool] = []
     for (attr, method), lines in sorted(lines_by_pair.items()):
         row = conn.execute(
@@ -327,7 +333,66 @@ def _extract_and_pin(conn: Connection, code: str) -> CompileResult:
         return CompileResult(ok=False, stage=STAGE_EXTRACT, errors=errors)
 
     pinned.sort(key=lambda t: (t.connector, t.tool))
-    return CompileResult(ok=True, tools_used=pinned, warnings=_warnings(calls, pinned))
+    return CompileResult(
+        ok=True,
+        tools_used=pinned,
+        warnings=_warnings(calls, pinned),
+        uses_ai=bool(ai_calls),
+    )
+
+
+def _ai_errors(calls: list[AiCall], model: Model | None) -> list[CompileError]:
+    """What can be settled about `ctx.ai(...)` before anything runs.
+
+    Two things, and both are worth catching here rather than three minutes into
+    a run: that there is a model to call at all, and that the schema will
+    actually constrain the answer.
+    """
+    if not calls:
+        return []
+
+    errors: list[CompileError] = []
+    if model is None:
+        errors.append(
+            CompileError(
+                STAGE_EXTRACT,
+                calls[0].line,
+                "this workflow calls `ctx.ai(...)` but no model is configured "
+                "on this machine",
+                "Whoever runs Runlace picks the model, with `runlace model set "
+                "<name>` -- a local Ollama needs nothing else. You cannot choose "
+                "one from a workflow. If the decision this step makes can be "
+                "written as an `if`, write it as an `if` instead.",
+                "no-model-configured",
+            )
+        )
+
+    for call in calls:
+        if not call.literal or call.schema is None:
+            continue
+        schema = call.schema
+        object_shaped = (
+            isinstance(schema, dict)
+            and schema.get("type") in (None, "object")
+            and isinstance(schema.get("properties"), dict)
+            and bool(schema.get("properties"))
+        )
+        if not object_shaped:
+            errors.append(
+                CompileError(
+                    STAGE_EXTRACT,
+                    call.line,
+                    "the schema given to `ctx.ai(...)` must be an object schema "
+                    "with properties",
+                    'Write schema={"type": "object", "properties": {...}, '
+                    '"required": [...]}. The answer comes back as a dict and is '
+                    "validated against this before your code sees it, so a "
+                    "schema without properties checks nothing. Leave `schema` "
+                    "out entirely if you want the raw text.",
+                    "ai-schema-not-an-object",
+                )
+            )
+    return errors
 
 
 def _unresolved(

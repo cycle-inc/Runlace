@@ -12,12 +12,14 @@ from typing import Any
 
 import pytest
 
+from runlace.ai import AiFailed, Answer
 from runlace.db import Connection, insert_tool
 from runlace.hashing import schema_hash
 from runlace.paths import RunlacePaths
 from runlace.runner import (
     STATUS_COMPLETED,
     STATUS_FAILED,
+    AiBridge,
     Outcome,
     Step,
     ToolFailed,
@@ -55,6 +57,7 @@ def run(
     *,
     inputs: dict[str, Any] | None = None,
     call_tool: Any = None,
+    ai: AiBridge | None = None,
     timeout: float = 30.0,
 ) -> Outcome:
     steps: list[Step] = []
@@ -64,6 +67,7 @@ def run(
             code=code,
             inputs=inputs or {},
             call_tool=call_tool or Recorder(),
+            ai=ai,
             on_step=steps.append,
             timeout=timeout,
         )
@@ -556,3 +560,130 @@ def test_a_file_without_run_fails_cleanly(
     outcome = run(conn, code)
     assert outcome.status == STATUS_FAILED
     assert "callable `run`" in (outcome.message or "")
+
+
+# -- ctx.ai ----------------------------------------------------------------
+
+
+class Model:
+    """An injected `ask` that answers from a list and remembers the questions."""
+
+    def __init__(self, *answers: Any) -> None:
+        self.asked: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.answers = list(answers) or [Answer("ok")]
+
+    async def __call__(
+        self, system: str, user: str, schema: dict[str, Any] | None
+    ) -> Answer:
+        self.asked.append((system, user, schema))
+        answer = self.answers[min(len(self.asked), len(self.answers)) - 1]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def test_ctx_ai_reaches_the_model_and_returns_its_answer(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    _, conn = home
+    model = Model(Answer({"urgent": True}, tokens_in=120, tokens_out=8))
+    outcome = run(
+        conn,
+        workflow(
+            'v = ctx.ai(system="judge", user="pay this?",'
+            ' schema={"type": "object", "properties": {"urgent": {"type": "boolean"}}})\n'
+            'return {"urgent": v["urgent"]}'
+        ),
+        ai=AiBridge(ask=model),
+    )
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.output == {"urgent": True}
+    (system, user, schema) = model.asked[0]
+    assert (system, user) == ("judge", "pay this?")
+    assert schema == {"type": "object", "properties": {"urgent": {"type": "boolean"}}}
+
+
+def test_an_ai_call_becomes_a_step_with_its_tokens(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    _, conn = home
+    outcome = run(
+        conn,
+        workflow('return {"a": ctx.ai(system="s", user="u")}'),
+        ai=AiBridge(ask=Model(Answer("yes", tokens_in=30, tokens_out=2))),
+    )
+    (step,) = outcome.steps
+    assert (step.connector, step.tool, step.risk) == ("ai", "complete", "read_only")
+    assert (step.status, step.error) == ("ok", None)
+    assert (step.tokens_in, step.tokens_out) == (30, 2)
+    # The prompts are the step's payload: an AI step is auditable like any other.
+    assert step.payload == {"system": "s", "user": "u", "schema": None}
+    assert step.result == "yes"
+    assert step.to_json()["tokens"] == {"in": 30, "out": 2}
+
+
+def test_a_tool_step_reports_no_tokens(home: tuple[RunlacePaths, Connection]) -> None:
+    _, conn = home
+    outcome = run(conn, workflow("ctx.pennylane.get_balance()\nreturn {}"))
+    assert "tokens" not in outcome.steps[0].to_json()
+
+
+def test_the_risk_of_an_ai_step_is_the_bridges(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """A remote model is a side effect: the run's data left the machine."""
+    _, conn = home
+    outcome = run(
+        conn,
+        workflow('return {"a": ctx.ai(system="s", user="u")}'),
+        ai=AiBridge(ask=Model(), risk="side_effect"),
+    )
+    assert outcome.steps[0].risk == "side_effect"
+
+
+def test_a_model_that_fails_fails_the_step_not_runlace(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    _, conn = home
+    outcome = run(
+        conn,
+        workflow('return {"a": ctx.ai(system="s", user="u")}'),
+        ai=AiBridge(ask=Model(AiFailed("the model answered 404: no such model"))),
+    )
+    assert outcome.status == STATUS_FAILED
+    (step,) = outcome.steps
+    assert step.status == "error"
+    assert "no such model" in (step.error or "")
+    assert outcome.error is not None
+    assert "ctx.ai" in outcome.error["message"]
+
+
+def test_a_workflow_may_catch_a_model_failure_and_carry_on(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    _, conn = home
+    outcome = run(
+        conn,
+        workflow(
+            "try:\n"
+            '    answer = ctx.ai(system="s", user="u")\n'
+            "except Exception:\n"
+            '    answer = "unknown"\n'
+            'return {"a": answer}'
+        ),
+        ai=AiBridge(ask=Model(AiFailed("nope"))),
+    )
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.output == {"a": "unknown"}
+
+
+def test_ctx_ai_without_a_configured_model_says_so(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """Only reachable when the model went away after the workflow was created."""
+    _, conn = home
+    outcome = run(conn, workflow('return {"a": ctx.ai(system="s", user="u")}'))
+    assert outcome.status == STATUS_FAILED
+    assert outcome.steps == []
+    assert outcome.error is not None
+    assert "runlace model set" in outcome.error["message"]

@@ -14,8 +14,10 @@ from typing import Any
 
 import pytest
 
+from runlace.ai import AiFailed, Answer
 from runlace.db import Connection, find_run, list_steps
 from runlace.journal import MAX_ITEMS, get_step
+from runlace.model import Model, write_model
 from runlace.paths import RunlacePaths
 from runlace.runner import ToolFailed
 from runlace.runs import (
@@ -26,9 +28,13 @@ from runlace.runs import (
     CODE_UNKNOWN_CONNECTOR,
     CODE_UNKNOWN_WORKFLOW,
     CODE_WORKFLOW_FAILED,
+    _ai_bridge,
+    ai_risk,
     run_workflow,
 )
-from runlace.workflows import create_workflow, list_workflows
+from runlace.workflows import create_workflow, get_workflow, list_workflows
+
+LOOPBACK = "http://localhost:11434/v1"
 
 INPUTS = {
     "type": "object",
@@ -106,6 +112,7 @@ def execute(
     version: str | None = None,
     dry_run: bool = False,
     call_tool: Any = None,
+    ask: Any = None,
 ) -> dict[str, Any]:
     paths, conn = home
     return asyncio.run(
@@ -118,6 +125,7 @@ def execute(
             version=version,
             dry_run=dry_run,
             call_tool=call_tool or Recorder(),
+            ask=ask,
             timeout=30.0,
         )
     )
@@ -710,3 +718,143 @@ def test_a_dry_run_that_returns_the_wrong_shape_says_nothing_acted(
     assert real["code"] == dry["code"] == CODE_INVALID_OUTPUT
     assert "side effects happened" in real["hint"]
     assert "Nothing acted" in dry["hint"]
+
+
+# -- ctx.ai ----------------------------------------------------------------
+
+AI_WORKFLOW = (
+    "from runlace_types import Ctx\n\n\n"
+    "def run(ctx: Ctx) -> dict[str, object]:\n"
+    "    balance = ctx.pennylane.get_balance()\n"
+    "    verdict = ctx.ai(\n"
+    '        system="You are a bookkeeper.",\n'
+    "        user=str(balance),\n"
+    '        schema={"type": "object", "properties": {"healthy": {"type": "boolean"}},\n'
+    '                "required": ["healthy"]},\n'
+    "    )\n"
+    '    return {"healthy": verdict["healthy"]}\n'
+)
+
+
+def configure_model(paths: RunlacePaths, base_url: str = LOOPBACK) -> Model:
+    model = Model(base_url=base_url, model="qwen3:8b")
+    write_model(paths.model, model)
+    return model
+
+
+async def canned(system: str, user: str, schema: dict[str, Any] | None) -> Answer:
+    return Answer({"healthy": True}, tokens_in=210, tokens_out=6)
+
+
+def test_a_workflow_that_asks_the_model_runs_and_journals_the_exchange(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, conn = home
+    configure_model(paths)
+    store(home, AI_WORKFLOW, name="verdict")
+
+    result = execute(home, workflow="verdict", ask=canned)
+    assert result["ok"] is True, result
+    assert result["output"] == {"healthy": True}
+
+    row, steps = journal(conn, result["run_id"])
+    assert row["status"] == "completed"
+    assert [(s["connector"], s["tool"]) for s in steps] == [
+        ("pennylane", "get_balance"),
+        ("ai", "complete"),
+    ]
+    ai_step = get_step(conn, result["run_id"], 2)
+    assert ai_step["tokens"] == {"in": 210, "out": 6}
+    assert ai_step["payload"]["system"] == "You are a bookkeeper."
+    assert ai_step["risk"] == "read_only"
+
+
+def test_a_tool_step_is_journaled_without_tokens(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """"Not measured" and "free" are different facts; a 0 would blur them."""
+    home_paths, conn = home
+    configure_model(home_paths)
+    store(home, AI_WORKFLOW, name="verdict")
+    result = execute(home, workflow="verdict", ask=canned)
+    assert "tokens" not in get_step(conn, result["run_id"], 1)
+
+
+def test_a_model_that_fails_fails_the_run_with_the_reason(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, conn = home
+    configure_model(paths)
+    store(home, AI_WORKFLOW, name="verdict")
+
+    async def broken(system: str, user: str, schema: dict[str, Any] | None) -> Answer:
+        raise AiFailed("the model answered 404: model `qwen3:8b` not found")
+
+    result = execute(home, workflow="verdict", ask=broken)
+    assert result["ok"] is False
+    assert result["code"] == CODE_WORKFLOW_FAILED
+    assert "not found" in json.dumps(result)
+
+    _, steps = journal(conn, result["run_id"])
+    assert steps[1]["status"] == "error"
+
+
+def test_a_workflow_that_asks_the_model_is_marked_as_such(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """`uses_ai` is on the version, not in `tools_used`: `ai` is no connector."""
+    paths, conn = home
+    configure_model(paths)
+    store(home, AI_WORKFLOW, name="verdict")
+    record = get_workflow(conn, "verdict")
+    assert record is not None
+    assert record["uses_ai"] is True
+    assert record["tools_used"] == [
+        {
+            "connector": "pennylane",
+            "tool": "get_balance",
+            "risk": "read_only",
+            "schema_hash": record["tools_used"][0]["schema_hash"],
+        }
+    ]
+
+
+def test_a_workflow_that_does_not_ask_the_model_is_not_marked(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    _, conn = home
+    store(home, READ_ONLY, name="plain")
+    record = get_workflow(conn, "plain")
+    assert record is not None
+    assert record["uses_ai"] is False
+
+
+# -- what the bridge is made of --------------------------------------------
+
+
+def test_a_model_on_this_machine_makes_an_ai_step_a_read() -> None:
+    assert ai_risk(Model(base_url=LOOPBACK, model="qwen3:8b")) == "read_only"
+
+
+def test_a_model_somewhere_else_makes_an_ai_step_a_side_effect() -> None:
+    """The run's data left the machine. What the provider does with it is theirs."""
+    remote = Model(base_url="https://api.openai.com/v1", model="gpt-4o-mini")
+    assert ai_risk(remote) == "side_effect"
+
+
+def test_with_no_model_configured_there_is_no_bridge(paths: RunlacePaths) -> None:
+    assert _ai_bridge(paths, None) is None
+
+
+def test_the_configured_model_is_what_the_bridge_reaches(paths: RunlacePaths) -> None:
+    configure_model(paths, base_url="https://openrouter.ai/api/v1")
+    bridge = _ai_bridge(paths, None)
+    assert bridge is not None
+    assert bridge.risk == "side_effect"
+
+
+def test_an_injected_model_is_treated_as_local(paths: RunlacePaths) -> None:
+    """A fake sends nothing anywhere, so a test does not have to confirm a run."""
+    bridge = _ai_bridge(paths, canned)
+    assert bridge is not None
+    assert bridge.risk == "read_only"

@@ -28,6 +28,7 @@ from .db import (
     update_workflow_description,
 )
 from .hashing import version_hash as compute_version_hash
+from .model import read_model
 from .paths import RunlacePaths
 
 # Workflow names become directory names, so they stay boring on purpose.
@@ -100,6 +101,7 @@ def create_workflow(
         code=code,
         inputs_schema=inputs_schema,
         outputs_schema=outputs_schema,
+        model=read_model(paths.model),
     )
     if not compiled.ok:
         return CreateResult(ok=False, stage=compiled.stage, errors=compiled.errors)
@@ -306,6 +308,7 @@ def _store(
         inputs_schema=inputs_schema,
         outputs_schema=outputs_schema,
         tools_used=tools_used,
+        uses_ai=compiled.uses_ai,
     )
     conn.commit()
 
@@ -382,6 +385,7 @@ def get_workflow(
         "inputs_schema": _json_object(version_row["inputs_schema_json"]),
         "outputs_schema": _json_object(version_row["outputs_schema_json"]),
         "tools_used": tools_used,
+        "uses_ai": bool(version_row["uses_ai"]),
         "drift": schema_drift(conn, tools_used),
         "versions": [
             {

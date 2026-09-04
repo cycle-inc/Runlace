@@ -5,18 +5,21 @@ LiteLLM, OpenRouter, vLLM, llama.cpp and the commercial APIs all speak it. No
 provider SDKs and no agent framework: a base URL, a model name and an optional
 key cover every backend a user plausibly has, and LiteLLM proxies the rest.
 
-This module is transport only. Building the conversation, validating structured
-output and retrying a model that ignored its schema belong to the caller.
+:func:`complete` is transport. :func:`answer` is the step a workflow actually
+takes: one question, structured output validated locally against the schema, and
+a single retry that shows the model what was wrong with its first attempt.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
 import httpx2
 
 from .model import Model
+from .validation import validate
 
 # How much of an error body to quote back. Enough to see "model not found" or a
 # provider's JSON error, short enough not to paste a stack trace into a journal.
@@ -141,3 +144,101 @@ def _read(data: Any, model: Model) -> Completion:
 
 def _count(value: Any) -> int | None:
     return int(value) if isinstance(value, (int, float)) else None
+
+
+# -- one AI step -----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Answer:
+    """What one `ctx.ai(...)` call produced: the value, and what it cost.
+
+    ``value`` is a validated ``dict`` when a schema was given and the raw
+    string when it was not, which is exactly what the stub promises.
+    """
+
+    value: Any
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+
+
+async def answer(
+    model: Model,
+    *,
+    system: str,
+    user: str,
+    schema: dict[str, Any] | None = None,
+) -> Answer:
+    """Ask once, and if the shape is wrong, ask once more and then give up.
+
+    One retry rather than none, because a model that fumbles JSON on the first
+    pass usually fixes it when told what was wrong -- and one rather than
+    several, because a workflow silently spending four calls on one step is the
+    behaviour people who avoid agent frameworks are avoiding.
+    """
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    first = await complete(model, messages, schema=schema)
+    if schema is None:
+        return Answer(first.text, first.tokens_in, first.tokens_out)
+
+    value, problem = _structured(first.text, schema)
+    if problem is None:
+        return Answer(value, first.tokens_in, first.tokens_out)
+
+    second = await complete(
+        model,
+        [
+            *messages,
+            {"role": "assistant", "content": first.text},
+            {
+                "role": "user",
+                "content": f"That answer was rejected: {problem}. Answer again "
+                f"with JSON matching the schema exactly, and nothing else -- no "
+                f"prose, no code fence.",
+            },
+        ],
+        schema=schema,
+    )
+    # Both attempts are charged for, so both are counted.
+    tokens_in = _add(first.tokens_in, second.tokens_in)
+    tokens_out = _add(first.tokens_out, second.tokens_out)
+
+    value, problem = _structured(second.text, schema)
+    if problem is not None:
+        raise AiFailed(
+            f"the model did not answer with the shape this step asked for, "
+            f"twice. Second attempt: {problem}"
+        )
+    return Answer(value, tokens_in, tokens_out)
+
+
+def _structured(text: str, schema: dict[str, Any]) -> tuple[Any, str | None]:
+    """Parse and validate one answer. Returns ``(value, what is wrong)``."""
+    try:
+        value = json.loads(_unfence(text))
+    except json.JSONDecodeError as exc:
+        return None, f"it is not JSON ({exc.msg})"
+    errors = validate(schema, value)
+    if errors:
+        return None, "; ".join(str(e) for e in errors)
+    return value, None
+
+
+def _unfence(text: str) -> str:
+    """Drop a ```json fence. Models add one however firmly they are told not to."""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    body = stripped[3:]
+    if body.lower().startswith("json"):
+        body = body[4:]
+    return body.rsplit("```", 1)[0].strip()
+
+
+def _add(left: int | None, right: int | None) -> int | None:
+    if left is None and right is None:
+        return None
+    return (left or 0) + (right or 0)

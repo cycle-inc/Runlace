@@ -54,6 +54,22 @@ def test_entry_without_command_or_url_is_skipped_with_a_warning() -> None:
     assert any("broken-no-command" in w for w in result.warnings)
 
 
+@pytest.mark.parametrize("reserved", ["ai", "inputs"])
+def test_a_server_cannot_take_a_name_ctx_already_has(
+    tmp_path: Path, reserved: str
+) -> None:
+    """`ctx.ai` and `ctx.inputs` are set on the object; a server by that name
+    would never be reached, and the stub would declare the attribute twice."""
+    source = tmp_path / "config.json"
+    source.write_text(
+        json.dumps({"mcpServers": {reserved: {"command": "node", "args": []}}}),
+        encoding="utf-8",
+    )
+    result = import_from_files([source])
+    assert result.connectors == []
+    assert any(f"ctx.{reserved}" in w for w in result.warnings)
+
+
 def test_missing_file_warns_but_does_not_fail(tmp_path: Path) -> None:
     result = import_from_files([tmp_path / "nope.json"])
     assert result.connectors == []

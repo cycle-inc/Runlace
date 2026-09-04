@@ -35,6 +35,12 @@ STATUS_FAILED = "failed"
 RUN_FUNCTION = "run"
 TYPES_MODULE = "runlace_types"
 
+# `ctx.ai(...)` is sent as a call on a connector by this name. No MCP server can
+# be called `ai` -- the config layer refuses it -- so the parent can tell the two
+# apart by looking at one field.
+AI_CONNECTOR = "ai"
+AI_TOOL = "complete"
+
 # The import allowlist ships with the runner. These are imported here, and then
 # sys.path is emptied, so the workflow cannot reach the site-packages the parent
 # process happens to have -- Runlace's own package and its MCP clients included.
@@ -120,6 +126,29 @@ class Tool:
         return f"<tool ctx.{self._connector}.{self._tool}>"
 
 
+class Ai:
+    """``ctx.ai``. One attribute deep, because there is nothing to name.
+
+    It travels the same pipe as a tool call, under a connector name no MCP
+    server can have, so timing, journaling and the failure path are the ones
+    every other call already gets.
+    """
+
+    def __init__(self, channel: Channel) -> None:
+        self._channel = channel
+
+    def __call__(
+        self, *, system: str, user: str, schema: dict[str, Any] | None = None
+    ) -> Any:
+        arguments: dict[str, Any] = {"system": system, "user": user}
+        if schema is not None:
+            arguments["schema"] = schema
+        return self._channel.call(AI_CONNECTOR, AI_TOOL, arguments)
+
+    def __repr__(self) -> str:
+        return "<ctx.ai>"
+
+
 class Connector:
     def __init__(self, channel: Channel, name: str) -> None:
         self._channel = channel
@@ -139,10 +168,14 @@ class Ctx:
 
     Connector attributes resolve through ``__getattr__`` (D2); nothing is
     resolved until it is called, and nothing here knows what an MCP server is.
+    ``ai`` is set here rather than left to ``__getattr__`` so that it is a
+    callable and not a connector -- and so that a server named ``ai`` could
+    never shadow it.
     """
 
     def __init__(self, channel: Channel, inputs: dict[str, Any]) -> None:
         self.inputs = inputs
+        self.ai = Ai(channel)
         self._channel = channel
 
     def __getattr__(self, name: str) -> Connector:

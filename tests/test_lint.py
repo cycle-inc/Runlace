@@ -399,3 +399,23 @@ def test_a_decorator_elsewhere_is_none_of_our_business() -> None:
         "def run(ctx: Ctx) -> dict[str, object]:\n    return {}\n"
     )
     assert lint(code) == []
+
+
+# -- ctx.ai ----------------------------------------------------------------
+
+
+def test_calling_ctx_ai_is_allowed() -> None:
+    assert lint(workflow('verdict = ctx.ai(system="judge", user="spam?")')) == []
+
+
+def test_referencing_ctx_ai_without_calling_it_is_rejected() -> None:
+    """Extraction reads AI steps off the source; a `ctx.ai` passed around is invisible."""
+    errors = lint(workflow("ask = ctx.ai"))
+    assert [e.code for e in errors] == [E_CTX_TOOL_NOT_CALLED]
+    assert "ctx.ai" in errors[0].message
+
+
+def test_ctx_ai_is_not_mistaken_for_a_connector() -> None:
+    """`ctx.ai.complete(...)` is the shape a model reaches for; it is not a server."""
+    errors = lint(workflow('ctx.ai.complete(system="s", user="u")'))
+    assert [e.code for e in errors] == [E_CTX_TOOL_NOT_CALLED]

@@ -129,12 +129,18 @@ def render_connector_stub(connector: ConnectorSpec) -> tuple[str, list[str]]:
 
 
 def render_ctx_stub(connectors: list[ConnectorSpec]) -> str:
-    parts = [HEADER, "\nfrom ._workflow import Inputs\n"]
+    parts = [
+        HEADER,
+        "\nfrom typing import Any, overload\n",
+        "\nfrom ._workflow import Inputs\n",
+    ]
     for c in connectors:
         parts.append(f"from .connectors.{c.attr} import {c.class_name}\n")
+    parts.append("\n" + AI_STUB)
     parts.append("\nclass Ctx:\n")
     parts.append(indent_docstring(CTX_DOC, "    ") + "\n\n")
     parts.append("    inputs: Inputs\n")
+    parts.append("    ai: Ai\n")
     for c in connectors:
         parts.append(f"    {c.attr}: {c.class_name}\n")
     return "".join(parts)
@@ -144,7 +150,38 @@ CTX_DOC = """What a workflow receives.
 
 Call tools as ctx.<connector>.<tool>(**kwargs). Use static attribute access
 only -- getattr(ctx, name) is rejected at create time.
+
+ctx.ai(...) asks the model this machine is configured with. You do not choose
+the model; whoever runs Runlace did.
 """
+
+# Two overloads and not a generic: with a schema the answer is a validated
+# dict, without one it is the raw text. The dict is `dict[str, Any]` rather
+# than a type derived from the schema -- deriving one would mean synthesising a
+# TypedDict per call site, and Pydantic already rejects a wrong answer one line
+# later with a better message than pyright could give.
+AI_STUB = '''class Ai:
+    """Ask the configured model one question and get one answer back.
+
+    system  what the model is; keep it fixed across runs.
+    user    what to answer about this run; put the run's data here.
+    schema  a JSON Schema object. With it the answer is validated against the
+            schema and comes back as a dict, and a model that ignores the
+            schema is asked once more before the step fails. Without it you
+            get the raw string.
+
+    The model, its endpoint and its key are configured on this machine and
+    cannot be chosen from a workflow. The call is journaled like a tool call,
+    tokens included.
+    """
+
+    @overload
+    def __call__(self, *, system: str, user: str) -> str: ...
+    @overload
+    def __call__(
+        self, *, system: str, user: str, schema: dict[str, Any]
+    ) -> dict[str, Any]: ...
+'''
 
 
 WORKFLOW_TYPES_STUB = "_workflow.pyi"

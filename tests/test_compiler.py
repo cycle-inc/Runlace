@@ -15,6 +15,7 @@ from runlace.compiler import (
     compile_workflow,
 )
 from runlace.db import Connection
+from runlace.model import Model
 from runlace.paths import RunlacePaths
 from runlace.typecheck import Diagnostic
 
@@ -502,3 +503,115 @@ def test_unknown_types_survive_when_they_are_the_whole_complaint() -> None:
         diagnostic(6, 'Type of "append" is unknown', "reportUnknownMemberType"),
     ]
     assert _without_cascades(diagnostics) == diagnostics
+
+
+# -- ctx.ai ----------------------------------------------------------------
+
+LOCAL_MODEL = Model(base_url="http://localhost:11434/v1", model="qwen3:8b")
+
+AI_WORKFLOW = """\
+from runlace_types import Ctx
+
+
+def run(ctx: Ctx) -> dict[str, object]:
+    verdict = ctx.ai(
+        system="You classify invoices.",
+        user=str(ctx.inputs["email"]),
+        schema={
+            "type": "object",
+            "properties": {"urgent": {"type": "boolean"}},
+            "required": ["urgent"],
+        },
+    )
+    return {"urgent": verdict["urgent"]}
+"""
+
+
+def test_a_workflow_that_calls_the_model_compiles_and_is_marked(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, conn = home
+    result = compile_workflow(
+        conn,
+        paths.types,
+        name="probe",
+        code=AI_WORKFLOW,
+        inputs_schema=INPUTS,
+        model=LOCAL_MODEL,
+    )
+    assert result.ok, [str(e) for e in result.errors]
+    assert result.uses_ai
+    # An AI step is not a tool: nothing in `tools_used` resolves to a connector
+    # called `ai`, and a run would refuse to start if one did.
+    assert result.tools_used == []
+
+
+def test_a_workflow_without_ai_is_not_marked(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, conn = home
+    result = compile_workflow(
+        conn, paths.types, name="probe", code=READ_ONLY, inputs_schema=INPUTS
+    )
+    assert result.ok, [str(e) for e in result.errors]
+    assert not result.uses_ai
+
+
+def test_calling_the_model_with_no_model_configured_is_refused(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """Better here than three minutes into a run that cannot finish."""
+    paths, conn = home
+    result = compile_workflow(
+        conn, paths.types, name="probe", code=AI_WORKFLOW, inputs_schema=INPUTS
+    )
+    assert not result.ok
+    assert result.stage == STAGE_EXTRACT
+    assert [e.code for e in result.errors] == ["no-model-configured"]
+    assert result.errors[0].line == 5
+    assert "runlace model set" in (result.errors[0].hint or "")
+
+
+def test_a_schema_that_constrains_nothing_is_refused(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    paths, conn = home
+    code = (
+        "from runlace_types import Ctx\n\n\n"
+        "def run(ctx: Ctx) -> dict[str, object]:\n"
+        '    return ctx.ai(system="s", user="u", schema={"type": "string"})\n'
+    )
+    result = compile_workflow(
+        conn,
+        paths.types,
+        name="probe",
+        code=code,
+        inputs_schema=INPUTS,
+        model=LOCAL_MODEL,
+    )
+    assert not result.ok
+    assert [e.code for e in result.errors] == ["ai-schema-not-an-object"]
+
+
+def test_without_a_schema_the_answer_is_a_string_at_typecheck(
+    home: tuple[RunlacePaths, Connection]
+) -> None:
+    """The two overloads are the whole point: no schema, no dict."""
+    paths, conn = home
+    code = (
+        "from runlace_types import Ctx\n\n\n"
+        "def run(ctx: Ctx) -> dict[str, object]:\n"
+        '    answer = ctx.ai(system="s", user="u")\n'
+        '    return {"urgent": answer["urgent"]}\n'
+    )
+    result = compile_workflow(
+        conn,
+        paths.types,
+        name="probe",
+        code=code,
+        inputs_schema=INPUTS,
+        model=LOCAL_MODEL,
+    )
+    assert not result.ok
+    assert result.stage == STAGE_TYPECHECK
+    assert [e.line for e in result.errors] == [6]
