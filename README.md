@@ -1,7 +1,8 @@
 # Runlace
 
-Deterministic, replayable workflows over your MCP servers. An LLM writes a
-workflow once; afterwards it runs with no model in the loop.
+Replayable workflows over your MCP servers. An LLM writes a workflow once;
+afterwards it runs with no model in the loop, unless the workflow itself asked
+for one -- see [M10](#m10--judgement-inside-a-workflow).
 
 See `SPEC.md` for the full design. It is committed verbatim and still uses the
 working name `harness` throughout; everything in this repo has since been
@@ -73,7 +74,7 @@ tools:
 | `create_workflow` | compile a workflow and, if it passes, store a version |
 | `list_workflows` | one line per workflow |
 | `get_workflow` | the code, the schemas, the pinned tools, the version list |
-| `run_workflow` | execute one, with no model in the loop (M3) |
+| `run_workflow` | execute one, no model in the loop unless it calls `ctx.ai` (M3) |
 
 ```
 runlace serve             # stdio
@@ -118,7 +119,8 @@ existing version instead of duplicating it.
 
 ## M3 — the runner
 
-`run_workflow` executes a stored version. No model is involved: it just runs.
+`run_workflow` executes a stored version. Nothing calls a model unless the
+workflow's own code does (M10); otherwise it just runs.
 
 ```
 run_workflow(workflow_id, inputs, confirm=False, version=None)
@@ -341,6 +343,63 @@ version that was edited stays on disk, readable and runnable.
 `server-everything`: a workflow with a division by zero pyright cannot see, a
 dry run that finds it on real data without toggling anything, a one-string fix,
 a second dry run that passes, then refused-without-confirm and completed-with-it.
+
+## M10 — judgement inside a workflow
+
+Some steps are not code. "Is this invoice hosting or travel", "summarise this
+thread in one line": no `if` gets there, and a workflow that cannot ask stops at
+the first one. `ctx.ai(...)` asks.
+
+```python
+verdict = ctx.ai(
+    system="You classify expenses. Answer with the category only.",
+    user=f"Vendor: {tx['vendor']}. Memo: {tx['memo']}",
+    schema={"type": "object", "properties": {"category": {"type": "string"}},
+            "required": ["category"]},
+)
+```
+
+The model is a property of the machine, not of the workflow. Whoever runs
+Runlace picks it once -- `runlace init --model qwen3:8b`, or `runlace model set`
+later -- and the workflow never names one. Any OpenAI-shaped endpoint works,
+which is all of them: Ollama, LiteLLM, OpenRouter, vLLM, llama.cpp, the
+commercial APIs.
+
+```
+runlace model set qwen3:8b                        # a local Ollama, the default
+runlace model set gpt-4o-mini \
+  --base-url https://api.openai.com/v1 \
+  --api-key '${OPENAI_API_KEY}'                   # expanded at run time, never stored
+runlace model show
+```
+
+`model set` asks the model one question before saving, so a backend that is down
+or a model that was never pulled is a problem you have at configuration time
+rather than three minutes into a run.
+
+With a `schema` the answer is validated locally against it -- the same Pydantic
+path as every other schema here -- and comes back as a dict; a model that
+answers the wrong shape is shown the error and asked once more before the step
+fails. Without a schema you get the raw string. The call is journaled like a
+tool call, prompts and tokens included, so `get_step` shows what the model
+actually said.
+
+**Distance decides the risk.** A model on this machine has sent nothing
+anywhere, so an AI step against it is a read. A remote one has handed the run's
+data to somebody else, so it goes through the confirm gate like sending an
+email, and a dry run invents its answer from the schema rather than asking.
+`policy.yaml` overrides it per model name, in both directions:
+
+```yaml
+risk:
+  ai:
+    gpt-4o-mini: read_only
+```
+
+**The honest cost.** A workflow with an AI step is no longer deterministic: two
+runs can differ. Everything else holds -- the same code, the same pinned tools,
+the same journal, the same gates -- and a workflow that does not call `ctx.ai`
+is exactly what it was before. It is opt-in one line at a time.
 
 ## Adding MCP servers after the first run
 

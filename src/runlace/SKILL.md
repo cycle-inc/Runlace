@@ -2,8 +2,9 @@
 
 Runlace turns a piece of Python into a stored, replayable workflow over the MCP
 servers this machine is connected to. You write it once, a compiler checks it
-against the real tool schemas, and afterwards it runs with no model in the loop:
-same code, same tools, same result, journaled every time. Your job is to produce
+against the real tool schemas, and afterwards it runs without you: same code,
+same tools, journaled every time. Nothing calls a model unless the workflow
+itself asked for one — see "Judgement inside a workflow". Your job is to produce
 that code once and get it to compile.
 
 ## The loop
@@ -140,6 +141,41 @@ names: list[str] = []          # annotate it, or use a comprehension
 for repo in result["items"]:
     names.append(str(repo["name"]))
 ```
+
+## Judgement inside a workflow
+
+Some steps are not code. "Is this invoice hosting or travel", "summarise this
+thread in one line" — no `if` gets there. For those, and only those, call
+`ctx.ai(...)`:
+
+```python
+verdict = ctx.ai(
+    system="You classify expenses. Answer with the category only.",
+    user=f"Vendor: {tx['vendor']}. Memo: {tx['memo']}",
+    schema={
+        "type": "object",
+        "properties": {"category": {"type": "string"}},
+        "required": ["category"],
+    },
+)
+if verdict["category"] == "travel":
+    ...
+```
+
+- You do not choose the model, and there is no argument for choosing one.
+  Whoever runs Runlace configured a model for the machine; `ctx.ai` reaches it.
+  If none is configured, `create_workflow` refuses the code and says so.
+- With `schema` the answer is validated against it before your code sees it and
+  arrives as a dict; the schema must be an object with properties. Without
+  `schema` you get the raw string. A model that answers the wrong shape is asked
+  once more, and then the step fails.
+- The call is journaled like a tool call — both prompts, the answer, the tokens
+  — so `get_step(run_id, seq)` shows you what the model actually said.
+- It costs determinism: two runs of a workflow with an AI step can differ. Keep
+  them rare, keep `system` fixed across runs, and put the run's data in `user`.
+- If this machine's model is a remote one, an AI step is a side effect like
+  sending mail — the run needs `confirm=True`, and a dry run invents the answer
+  from your schema instead of asking.
 
 ## The inputs rule
 

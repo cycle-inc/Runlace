@@ -32,8 +32,9 @@ from .workflows import list_workflows as _list_workflows
 SERVER_NAME = "runlace"
 
 INSTRUCTIONS = """\
-Runlace stores deterministic, replayable workflows over this machine's MCP
-servers. Call get_skill first: it returns the calling convention and the exact
+Runlace stores replayable workflows over this machine's MCP servers -- the
+code runs without you afterwards, and calls a model only where it asked to.
+Call get_skill first: it returns the calling convention and the exact
 connectors and tools available here. Then create_workflow with the code,
 dry_run_workflow to check it really works, edit_workflow to fix what it turns
 up, and run_workflow to execute it for real. If what the human wants is not
@@ -285,7 +286,9 @@ def build_server(
         version: str | None = None,
         wait: float | None = None,
     ) -> dict[str, Any]:
-        """Execute a stored workflow. No model is involved: it just runs.
+        """Execute a stored workflow. It runs; you are not in the loop.
+
+        No model is involved unless the workflow's own code calls ctx.ai.
 
         `workflow_id` may also be the workflow's name. `inputs` must match the
         workflow's inputs_schema; call get_workflow if you are unsure what it
@@ -364,6 +367,10 @@ def build_server(
         own declared output shape instead of being called, so nothing is sent,
         created or deleted. There is no confirm gate here, because there is
         nothing to confirm.
+
+        A `ctx.ai` step is asked for real when this machine's model is a local
+        one and invented from the call's schema when it is a remote one -- the
+        same rule: whatever would leave the machine is stood in for.
 
         Same result as run_workflow, plus {dry_run: true, simulated: [...]}.
         `simulated` is the list of calls that were stood in for: a branch that

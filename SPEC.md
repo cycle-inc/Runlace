@@ -438,11 +438,11 @@ Named, not numbered, as in v2.
 | Name | Decision |
 |---|---|
 | **the-model-is-declared-once** | The model, its endpoint and its key are configured **at `runlace init`** (or `runlace model set`) and live in `~/.runlace/model.json`. Workflow code never names a model, a provider, a temperature or a token budget — `ctx.ai(system=…, user=…, schema=…)` is the whole surface. Two reasons and both are load-bearing: the agent writing the workflow is not the party who pays for inference or answers for where the data went, so it does not get to choose; and a workflow that hard-codes `gpt-4o-mini` is a workflow that breaks the day the developer switches to a local model. A per-call `model=` override is deliberately deferred — it is easy to add later and impossible to remove. |
-| **one-openai-shaped-client** | Ollama, LiteLLM, OpenRouter, vLLM, llama.cpp and the commercial APIs all speak `POST /v1/chat/completions`. Runlace implements that one shape over `httpx` and nothing else. No provider SDKs, no LangChain, no litellm-as-a-dependency: a `base_url` plus a `model` plus an optional key covers every backend a user will plausibly have, and the ones it does not cover, LiteLLM already proxies. |
+| **one-openai-shaped-client** | Ollama, LiteLLM, OpenRouter, vLLM, llama.cpp and the commercial APIs all speak `POST /v1/chat/completions`. Runlace implements that one shape over the HTTP client it already ships with (`httpx2`) and nothing else. No provider SDKs, no LangChain, no litellm-as-a-dependency: a `base_url` plus a `model` plus an optional key covers every backend a user will plausibly have, and the ones it does not cover, LiteLLM already proxies. |
 | **the-schema-is-the-contract** | With a `schema`, `ctx.ai` returns a `dict` **validated against that JSON Schema with Pydantic** before the workflow ever sees it. Invalid output is retried **once**, with the validation error fed back to the model as a further turn; a second failure fails the step like any other tool error. The schema is also sent to the backend as `response_format: json_schema` when it accepts one, but validation happens locally regardless, because "the provider said it supports it" is not evidence. Without a `schema`, `ctx.ai` returns the raw `str`. |
 | **runtime-typed-not-static** | `ctx.ai(..., schema=...)` is typed `dict[str, Any]` in the stubs, not a generated `TypedDict`. pyright therefore will **not** catch `verdict["categorie"]`. This is a real hole and it is accepted on purpose: the schema is a literal in the workflow body, so deriving a static type from it means running the compiler over the AST of a dict literal and synthesising a `.pyi` per call site — a large amount of machinery for a guarantee the run-time validation already provides, one line later, with a better error message. Revisit only if it bites in practice. |
 | **distance-decides-the-risk** | An AI step is a tool call and gets a risk like any other. **A model on loopback (`localhost`, `127.0.0.1`, `[::1]`) is `read_only`**: nothing left the machine. **Anything else is `side_effect`**, because sending the user's invoice lines to a third party *is* an effect on the world, and it is exactly the effect a developer wants a gate on. So a workflow using a remote model parks for approval unless the developer allowed it, and a dry run **simulates** the remote call while **really running** the local one. Overridable per model in `policy.yaml`, same mechanism as any other tool. |
-| **an-ai-step-is-a-journaled-step** | No new table, no new trace format. An AI call is a row in `steps` with `connector = "ai"`, the prompts as its payload, the answer as its result, and two new columns for tokens. Whatever the journal already does — truncation budgets, `get_step`, timings, the failure path — it does for AI steps for free. `ai` becomes a **reserved connector name**: `add_connector` refuses it. |
+| **an-ai-step-is-a-journaled-step** | No new table, no new trace format. An AI call is a row in `steps` with `connector = "ai"`, the prompts as its payload, the answer as its result, and two new columns for tokens. Whatever the journal already does — truncation budgets, `get_step`, timings, the failure path — it does for AI steps for free. `ai` becomes a **reserved connector name**: `add_connector` refuses it. **Amended in M10.2: an AI call is a journaled *step* but is deliberately not a pinned *tool*. `_connectors_for` resolves every name in `tools_used` against `config.json` and would refuse every AI run with "connector `ai` is no longer configured"; `workflow_versions.uses_ai` records the fact instead. `inputs` is reserved alongside `ai`, for the same reason — `ctx` already has both.** |
 
 ## Configuration
 
@@ -474,6 +474,10 @@ rather than at run time is the whole point of the compiler.
 -- v7
 ALTER TABLE steps ADD COLUMN tokens_in  INTEGER;   -- NULL for tool steps
 ALTER TABLE steps ADD COLUMN tokens_out INTEGER;
+-- added in M10.2: `ai` is not a connector, so an AI call cannot be pinned into
+-- `tools_used` the way a tool call is. This is where "this version asks a
+-- model" lives.
+ALTER TABLE workflow_versions ADD COLUMN uses_ai INTEGER NOT NULL DEFAULT 0;
 ```
 
 Cost is the first question anyone asks about a workflow that calls a model, and
@@ -500,8 +504,16 @@ prompts · fine-tuning anything.
    learns the one-attribute-deep shape so the compiler sees the call; create-time
    refusal when no model is configured or when a `schema` is not a valid JSON
    Schema literal; `steps` v7 and the token columns.
-3. **The gates.** Risk from the configured `base_url`, taking the stricter of
-   pinned and current as `_effective_risk` already does; parking and `confirm`
+3. **The gates.** Risk from the configured `base_url` ~~, taking the stricter of
+   pinned and current as `_effective_risk` already does~~ **— from the current
+   model alone. There is nothing pinned to be stricter than: an AI step is not
+   in `tools_used` (see the amendment under
+   [an-ai-step-is-a-journaled-step](#locked-decisions-for-v3)), and the model is
+   a property of the machine, which may have changed between two runs of the
+   same version. `policy.yaml` overrides it per model name in both directions,
+   unlike a tool's pinned risk, which only tightens: "I trust this provider with
+   this data" is as legitimate a sentence as its opposite, and only the user can
+   say either.**; parking and `confirm`
    behave for a remote model exactly as for `gmail.send_email`; dry run
    synthesises the remote answer from the schema and really calls a local model.
 4. **The story.** SKILL.md teaches `ctx.ai` — when to reach for it, why the
