@@ -7,6 +7,7 @@ command and easy to miss until it deletes something.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,17 @@ from runlace.cli import _init_model, app
 from runlace.paths import RunlacePaths
 
 runner = CliRunner()
+
+
+def plain(output: str) -> str:
+    """Help text with the colours taken out.
+
+    When FORCE_COLOR is set -- which uv does on CI -- rich renders the help
+    styled, and it styles an option name in pieces: `--env-file` comes out as
+    `-`, `-env`, `-file` with escape codes in between, so looking for the flag
+    finds nothing. Dropping the codes puts it back together.
+    """
+    return re.sub(r"\x1b\[[0-9;]*m", "", output)
 
 # Everything that connects to the servers and writes down what it found. A
 # `${VAR}` is resolved by the process opening the connection, so any of these
@@ -30,7 +42,7 @@ def test_every_command_that_rediscovers_takes_an_env_file(command: str) -> None:
     result = runner.invoke(app, [command, "--help"])
 
     assert result.exit_code == 0
-    assert "--env-file" in result.output
+    assert "--env-file" in plain(result.output)
 
 
 def test_version_is_printed_without_a_home(tmp_path: Path) -> None:
@@ -185,7 +197,7 @@ def test_init_configures_a_keyed_remote_model_in_one_command(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A remote backend needs a key, so `init` has to be able to take one."""
-    assert "--model-api-key" in runner.invoke(app, ["init", "--help"]).output
+    assert "--model-api-key" in plain(runner.invoke(app, ["init", "--help"]).output)
 
     # Nothing is listening on port 1: the hello fails, and init saves anyway.
     _init_model(
