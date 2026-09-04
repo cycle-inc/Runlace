@@ -244,6 +244,28 @@ def test_nobody_draining_is_a_question_you_can_ask(
     assert has_live_worker(conn) is False
 
 
+def test_a_queued_run_waits_out_the_daemon_being_restarted(
+    stored: tuple[RunlacePaths, Connection, str]
+) -> None:
+    """The durability claim, and the reason there is no queue table.
+
+    A run is queued while nothing is draining -- the daemon is being restarted,
+    or the machine was asleep. It is not lost and it is not retried: it is a row
+    in the same SQLite file the audit log lives in, and the next daemon finds it
+    exactly where the last one left it.
+    """
+    paths, conn, version_id = stored
+    asyncio.run(drain_until(paths, lambda: queue_lock_holder(conn) is not None))
+    assert queue_lock_holder(conn) is None  # the first daemon has gone
+
+    a_run(conn, version_id, "run_q", status=QUEUED)
+    assert status_of(conn, "run_q") == QUEUED  # nobody to take it
+
+    asyncio.run(drain_until(paths, lambda: status_of(conn, "run_q") == COMPLETED))
+
+    assert status_of(conn, "run_q") == COMPLETED
+
+
 async def with_a_worker(
     paths: RunlacePaths, conn: Connection, body: Callable[[], Any]
 ) -> Any:
