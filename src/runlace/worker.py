@@ -40,7 +40,12 @@ from .db import (
 )
 from .paths import RunlacePaths
 from .policy import read_policy
-from .queue import DEFAULT_APPROVAL_TTL_SECONDS, expire
+from .queue import (
+    DEFAULT_APPROVAL_TTL_SECONDS,
+    HEARTBEAT_SECONDS,
+    expire,
+    stale_before,
+)
 from .runs import Admitted, execute, side_effects_of
 from .workflows import get_workflow
 
@@ -56,22 +61,6 @@ DEFAULT_CONCURRENCY = 4
 # is one indexed SELECT, and the cost of getting it wrong is latency on every
 # single run.
 POLL_SECONDS = 0.25
-
-# The worker says it is alive this often, and a lock nobody has renewed for
-# three of those is considered abandoned. A daemon that was killed must not lock
-# the queue until a human notices.
-HEARTBEAT_SECONDS = 10.0
-STALE_AFTER_SECONDS = 3 * HEARTBEAT_SECONDS
-
-
-def has_live_worker(conn: Connection) -> bool:
-    """Is something draining this home's queue right now?
-
-    The question every caller of ``run_workflow`` has to ask, because the answer
-    decides whether it can hand a run over or has to run it itself.
-    """
-    holder = queue_lock_holder(conn)
-    return holder is not None and str(holder["heartbeat"]) >= _stale_before()
 
 
 class Worker:
@@ -198,15 +187,9 @@ class Worker:
             conn,
             owner_pid=self.owner_pid,
             hostname=self.hostname,
-            stale_before=_stale_before(),
+            stale_before=stale_before(),
         )
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _stale_before() -> str:
-    return (_now() - timedelta(seconds=STALE_AFTER_SECONDS)).isoformat(
-        timespec="seconds"
-    )

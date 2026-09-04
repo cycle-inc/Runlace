@@ -30,6 +30,7 @@ from .db import (
     close_parked_run,
     find_run,
     list_parked_runs,
+    queue_lock_holder,
 )
 from .runner import STATUS_COMPLETED, STATUS_FAILED
 
@@ -55,10 +56,35 @@ TERMINAL = frozenset({COMPLETED, FAILED, REJECTED, EXPIRED})
 # routes through email wants a day.
 DEFAULT_APPROVAL_TTL_SECONDS = 24 * 60 * 60
 
+# A worker says it is alive this often, and a lock nobody has renewed for three
+# of those is abandoned.
+HEARTBEAT_SECONDS = 10.0
+STALE_AFTER_SECONDS = 3 * HEARTBEAT_SECONDS
+
 CODE_UNKNOWN_RUN = "unknown-run"
 CODE_NOT_PARKED = "not-awaiting-approval"
 
 EXPIRY_NOTE = "no answer before the approval window closed"
+
+
+def has_live_worker(conn: Connection) -> bool:
+    """Is something draining this home's queue right now?
+
+    The question every caller of ``run_workflow`` has to ask, because the answer
+    decides whether it can hand a run over or has to run it itself. It lives
+    here rather than next to the worker so that the code deciding whether to
+    queue does not have to import the thing that would execute the queue.
+    """
+    holder = queue_lock_holder(conn)
+    return holder is not None and str(holder["heartbeat"]) >= stale_before()
+
+
+def stale_before(now: datetime | None = None) -> str:
+    """The heartbeat older than which a worker is presumed gone."""
+    moment = now or datetime.now(timezone.utc)
+    return (moment - timedelta(seconds=STALE_AFTER_SECONDS)).isoformat(
+        timespec="seconds"
+    )
 
 
 def approve(conn: Connection, run_id: str) -> dict[str, Any]:

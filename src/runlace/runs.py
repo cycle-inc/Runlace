@@ -20,6 +20,8 @@ the running part is what a worker picks up whenever it gets to it.
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,13 +29,17 @@ from typing import Any
 from .config import Connector, read_config
 from .db import (
     Connection,
+    enqueue_run,
+    find_run,
     finish_run,
     insert_run,
     insert_step,
     tool_output_schemas,
 )
+from .journal import get_run as read_run
 from .paths import RunlacePaths
 from .policy import Policy, read_policy
+from .queue import QUEUED, TERMINAL, has_live_worker
 from .runner import (
     DEFAULT_TIMEOUT_SECONDS,
     STATUS_COMPLETED,
@@ -56,6 +62,14 @@ CODE_UNKNOWN_CONNECTOR = "unknown-connector"
 CODE_CONNECT_FAILED = "connector-unreachable"
 CODE_WORKFLOW_FAILED = "workflow-failed"
 CODE_INVALID_OUTPUT = "invalid-output"
+CODE_NOT_FINISHED = "not-finished"
+
+# Where the run executed. Not the caller's choice, so it has to be in the answer.
+EXECUTED_INLINE = "inline"
+EXECUTED_QUEUED = "queued"
+
+# How often a caller waiting on a queued run looks to see whether it is over.
+POLL_SECONDS = 0.02
 
 
 @dataclass(frozen=True)
@@ -93,6 +107,7 @@ async def run_workflow(
     dry_run: bool = False,
     call_tool: CallTool | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    wait: float | None = None,
 ) -> dict[str, Any]:
     """Run one stored workflow. Returns a result; it does not raise for failures.
 
@@ -102,9 +117,26 @@ async def run_workflow(
     letting it act. Nothing leaves the machine, so there is no confirmation gate
     on it; every other gate still applies.
 
+    ``wait`` is how long to stay with the run once it is handed to a worker.
+    ``None`` waits for it to finish, which is what v1 did and still the right
+    default: an MCP host is a conversation, and a two-second workflow answered
+    in two seconds beats one the caller has to come back for. ``0`` returns as
+    soon as the run is in the queue. Anything else waits that many seconds and
+    then reports whatever state the run is in.
+
+    Where the run actually executes is not the caller's choice, and the answer
+    says which happened in ``executed``: ``queued`` when a daemon took it,
+    ``inline`` when there was no daemon to take it and this process ran it
+    itself. A difference in behaviour that depends on how the user launched the
+    server is exactly the kind of thing that must be in the answer rather than
+    in the docs.
+
     ``call_tool`` is injectable so tests can run a real subprocess against fake
-    tools. Left unset, sessions are opened to the connectors the workflow uses.
+    tools. Left unset, sessions are opened to the connectors the workflow uses;
+    it also forces the inline path, because a worker in another process has no
+    way to be handed a Python callable.
     """
+    handed_over = call_tool is None and has_live_worker(conn)
     admission = admit(
         conn,
         paths,
@@ -113,12 +145,16 @@ async def run_workflow(
         confirm=confirm,
         version=version,
         dry_run=dry_run,
+        queued=handed_over,
     )
     if isinstance(admission, Refused):
         return admission.result
-    return await execute(
-        conn, paths, admission, call_tool=call_tool, timeout=timeout
-    )
+    if not handed_over:
+        result = await execute(
+            conn, paths, admission, call_tool=call_tool, timeout=timeout
+        )
+        return {**result, "executed": EXECUTED_INLINE}
+    return await _wait_for(conn, admission, wait)
 
 
 def admit(
@@ -130,11 +166,18 @@ def admit(
     confirm: bool = False,
     version: str | None = None,
     dry_run: bool = False,
+    queued: bool = False,
 ) -> Refused | Admitted:
     """The gates: everything that can be decided before anything executes.
 
     Writes the run row, so a refusal is journaled like any other attempt, and
     touches no MCP server -- this is cheap and synchronous on purpose.
+
+    ``queued`` puts the run in the queue once it passes, for the caller that is
+    about to hand it to a worker instead of executing it. The row is opened as
+    ``running`` either way and only joins the queue at the end: a run that is
+    claimable while the gates are still deciding could be picked up and executed
+    a millisecond before being refused.
     """
     record = get_workflow(conn, workflow, version=version)
     if record is None:
@@ -221,6 +264,9 @@ def admit(
             side_effects=side_effects,
         )
 
+    if queued:
+        enqueue_run(conn, run_id)
+        conn.commit()
     return Admitted(
         run_id=run_id,
         record=record,
@@ -424,6 +470,53 @@ def _identity(run_id: str | None, record: dict[str, Any]) -> dict[str, Any]:
         "workflow_id": record.get("workflow_id"),
         "name": record.get("name"),
         "version": record.get("version"),
+    }
+
+
+async def _wait_for(
+    conn: Connection, admitted: Admitted, wait: float | None
+) -> dict[str, Any]:
+    """Stay with a queued run for as long as the caller asked, then report.
+
+    Polling, not a notification: the worker is often in another process, and a
+    SELECT on an indexed primary key every fiftieth of a second is cheaper than
+    anything that would let two processes signal each other.
+    """
+    deadline = None if wait is None else time.monotonic() + wait
+    while deadline is None or time.monotonic() < deadline:
+        row = find_run(conn, admitted.run_id)
+        if row is not None and str(row["status"]) in TERMINAL:
+            return {
+                **read_run(conn, admitted.run_id),
+                "executed": EXECUTED_QUEUED,
+            }
+        await asyncio.sleep(POLL_SECONDS)
+    return _unfinished(conn, admitted)
+
+
+def _unfinished(conn: Connection, admitted: Admitted) -> dict[str, Any]:
+    """The answer for a run that is still going when the caller stops waiting.
+
+    ``ok`` is false, and that is a judgement call worth defending: nothing has
+    failed. But this result is read overwhelmingly by a model, and of the two
+    ways to be wrong about it, "thought it was not done when it was" costs one
+    extra call, while "thought it was done when it was not" makes the agent
+    report a success that has not happened yet.
+    """
+    row = find_run(conn, admitted.run_id)
+    status = str(row["status"]) if row is not None else QUEUED
+    return {
+        **_identity(admitted.run_id, admitted.record),
+        "ok": False,
+        "code": CODE_NOT_FINISHED,
+        "status": status,
+        "executed": EXECUTED_QUEUED,
+        "dry_run": admitted.dry_run,
+        "error": None,
+        "hint": f"It is `{status}`. Nothing has been reported yet -- call "
+        f"get_run with this run_id to see how it went.",
+        "output": None,
+        "steps": [],
     }
 
 

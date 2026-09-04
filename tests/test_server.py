@@ -53,7 +53,7 @@ def tools_of(server: MCPServer) -> dict[str, Any]:
     return {t.name: t for t in asyncio.run(server.list_tools())}
 
 
-def test_the_server_exposes_the_ten_tools(
+def test_the_server_exposes_the_eleven_tools(
     home: tuple[RunlacePaths, Connection]
 ) -> None:
     paths, _ = home
@@ -69,6 +69,7 @@ def test_the_server_exposes_the_ten_tools(
         "get_workflow",
         "run_workflow",
         "dry_run_workflow",
+        "get_run",
         "get_step",
     }
     # Descriptions are the interface for a model; none may be empty.
@@ -262,7 +263,13 @@ def test_run_workflow_declares_its_arguments(
     paths, _ = home
     schema = tools_of(build_server(paths))["run_workflow"].input_schema
     assert schema["required"] == ["workflow_id"]
-    assert set(schema["properties"]) == {"workflow_id", "inputs", "confirm", "version"}
+    assert set(schema["properties"]) == {
+        "workflow_id",
+        "inputs",
+        "confirm",
+        "version",
+        "wait",
+    }
 
 
 def test_run_workflow_refuses_a_side_effect_without_confirm(

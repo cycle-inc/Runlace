@@ -499,6 +499,17 @@ def find_version_by_id(
     ).fetchone()
 
 
+def enqueue_run(conn: sqlite3.Connection, run_id: str) -> bool:
+    """Put an open run in line for a worker. False if it is no longer open."""
+    return bool(
+        conn.execute(
+            "UPDATE runs SET status = 'queued', queued_at = ? "
+            "WHERE id = ? AND status = 'running'",
+            (now_iso(), run_id),
+        ).rowcount
+    )
+
+
 def claim_queued_run(conn: sqlite3.Connection) -> sqlite3.Row | None:
     """Take the oldest queued run and mark it running, or return None.
 

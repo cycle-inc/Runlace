@@ -23,9 +23,11 @@ from runlace.db import (
     now_iso,
     queue_lock_holder,
 )
+from runlace.journal import get_run
 from runlace.paths import RunlacePaths
-from runlace.queue import AWAITING_APPROVAL, COMPLETED, QUEUED
-from runlace.worker import Worker, has_live_worker
+from runlace.queue import AWAITING_APPROVAL, COMPLETED, QUEUED, has_live_worker
+from runlace.runs import run_workflow
+from runlace.worker import Worker
 from runlace.workflows import create_workflow, get_workflow
 
 INPUTS = {
@@ -240,6 +242,112 @@ def test_nobody_draining_is_a_question_you_can_ask(
 
     assert asyncio.run(scenario()) is True
     assert has_live_worker(conn) is False
+
+
+async def with_a_worker(
+    paths: RunlacePaths, conn: Connection, body: Callable[[], Any]
+) -> Any:
+    """Run ``body`` while a worker is draining, then stop the worker."""
+    stop = asyncio.Event()
+    task = asyncio.create_task(Worker(paths).drain(stop))
+    try:
+        while not has_live_worker(conn):
+            await asyncio.sleep(0.01)
+        return await body()
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=30.0)
+
+
+def test_with_no_daemon_the_caller_runs_it_and_the_answer_says_so(
+    stored: tuple[RunlacePaths, Connection, str]
+) -> None:
+    """Over stdio there is nobody to hand the run to, so this process does it."""
+    paths, conn, _ = stored
+
+    result = asyncio.run(
+        run_workflow(conn, paths, workflow="greet", inputs={"to": "a@b.c"})
+    )
+
+    assert result["executed"] == "inline"
+    assert result["ok"] is True
+    assert result["output"] == {"greeted": "a@b.c"}
+
+
+def test_with_a_daemon_the_run_is_handed_over(
+    stored: tuple[RunlacePaths, Connection, str]
+) -> None:
+    paths, conn, _ = stored
+
+    async def scenario() -> dict[str, Any]:
+        return await with_a_worker(
+            paths,
+            conn,
+            lambda: run_workflow(conn, paths, workflow="greet", inputs={"to": "a@b.c"}),
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result["executed"] == "queued"
+    assert result["ok"] is True
+    assert result["output"] == {"greeted": "a@b.c"}
+
+
+def test_wait_zero_comes_back_with_a_run_id_and_nothing_else(
+    stored: tuple[RunlacePaths, Connection, str]
+) -> None:
+    """The whole point: the caller's turn ends now, the work goes on."""
+    paths, conn, _ = stored
+
+    async def scenario() -> tuple[dict[str, Any], dict[str, Any]]:
+        async def body() -> tuple[dict[str, Any], dict[str, Any]]:
+            handed = await run_workflow(
+                conn, paths, workflow="greet", inputs={"to": "a@b.c"}, wait=0
+            )
+            while not get_run(conn, str(handed["run_id"]))["finished"]:
+                await asyncio.sleep(0.02)
+            return handed, get_run(conn, str(handed["run_id"]))
+
+        return await with_a_worker(paths, conn, body)
+
+    handed, later = asyncio.run(scenario())
+
+    # Nothing failed, but nothing finished either, and an agent that read `ok`
+    # as "done" would report a success that has not happened.
+    assert handed["ok"] is False
+    assert handed["code"] == "not-finished"
+    assert handed["status"] in {QUEUED, "running"}
+    assert handed["output"] is None
+
+    assert later["ok"] is True
+    assert later["finished"] is True
+    assert later["output"] == {"greeted": "a@b.c"}
+    assert later["run_id"] == handed["run_id"]
+    assert later["name"] == "greet"
+
+
+def test_a_gate_still_answers_immediately_even_with_a_daemon_running(
+    stored: tuple[RunlacePaths, Connection, str]
+) -> None:
+    """A misspelled input is not news to break to someone three minutes later.
+
+    It also must never reach the queue: a run that is claimable while the gates
+    are still deciding could execute a millisecond before being refused.
+    """
+    paths, conn, _ = stored
+
+    async def scenario() -> dict[str, Any]:
+        return await with_a_worker(
+            paths,
+            conn,
+            lambda: run_workflow(conn, paths, workflow="greet", inputs={}, wait=0),
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result["ok"] is False
+    assert result["code"] == "invalid-inputs"
+    assert status_of(conn, str(result["run_id"])) == "failed"
 
 
 def test_a_run_that_started_is_allowed_to_finish_after_stop(

@@ -9,17 +9,20 @@ sqlite3 connections are not shared across threads.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Any, Iterator
+import asyncio
+from contextlib import asynccontextmanager, contextmanager
+from typing import Any, AsyncIterator, Iterator
 
 from mcp.server.mcpserver import MCPServer
 
 from .connect_cmd import add_connector as _add_connector
 from .db import Connection, connect
+from .journal import get_run as _get_run
 from .journal import get_step as _get_step
 from .paths import RunlacePaths, paths as default_paths
 from .runs import run_workflow as _run_workflow
 from .skill import build_skill, tool_types
+from .worker import Worker
 from .workflows import create_workflow as _create_workflow
 from .workflows import edit_workflow as _edit_workflow
 from .workflows import get_workflow as _get_workflow
@@ -37,10 +40,30 @@ among the connectors get_skill lists, add_connector connects a new server.
 """
 
 
-def build_server(paths: RunlacePaths | None = None) -> MCPServer:
-    """Create the MCP server. ``paths`` is injectable so tests can isolate it."""
+def build_server(paths: RunlacePaths | None = None, *, drain: bool = False) -> MCPServer:
+    """Create the MCP server. ``paths`` is injectable so tests can isolate it.
+
+    ``drain`` also runs the queue worker for as long as the server is up. It is
+    off by default because it is only true of a daemon: over stdio this process
+    dies when the MCP host disconnects, and a run left going here would be
+    killed mid-flight. See :mod:`runlace.worker`.
+    """
     home = paths or default_paths()
-    server = MCPServer(SERVER_NAME, instructions=INSTRUCTIONS)
+
+    @asynccontextmanager
+    async def lifespan(_: MCPServer) -> AsyncIterator[None]:
+        if not drain:
+            yield
+            return
+        stop = asyncio.Event()
+        worker = asyncio.create_task(Worker(home).drain(stop))
+        try:
+            yield
+        finally:
+            stop.set()
+            await worker
+
+    server = MCPServer(SERVER_NAME, instructions=INSTRUCTIONS, lifespan=lifespan)
 
     @contextmanager
     def session() -> Iterator[Connection]:
@@ -249,6 +272,7 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
         inputs: dict[str, Any] | None = None,
         confirm: bool = False,
         version: str | None = None,
+        wait: float | None = None,
     ) -> dict[str, Any]:
         """Execute a stored workflow. No model is involved: it just runs.
 
@@ -260,6 +284,13 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
         acts on the world, it is refused with {code: "needs-confirmation",
         side_effects: [...]}. Show the human exactly which tools those are, and
         call again with confirm=True only after they agree in the conversation.
+
+        By default this waits for the run to finish. `wait` is how many seconds
+        to stay with it instead: pass 0 to get a run_id back immediately, or a
+        number for a workflow you expect to be slow. When the time runs out you
+        get {ok: false, code: "not-finished", status} -- nothing has gone wrong,
+        the run is still going, and get_run with the same run_id is how you
+        find out how it ended.
 
         Returns {ok, run_id, status, output, steps}. `steps` says which tools
         were called and how they went, without their arguments or their
@@ -277,7 +308,24 @@ def build_server(paths: RunlacePaths | None = None) -> MCPServer:
                 inputs=inputs,
                 confirm=confirm,
                 version=version,
+                wait=wait,
             )
+
+    @server.tool()
+    def get_run(run_id: str) -> dict[str, Any]:
+        """Check how a run is going, or how it went.
+
+        The other half of `wait`: a run you did not stay for is read back here.
+        Returns the same shape run_workflow does -- {ok, status, output, steps}
+        -- plus `finished`, which is false while it is still queued or running.
+
+        A run can also be waiting on a human, and then `status` is
+        awaiting_approval. There is nothing you can do about that from here: it
+        is the person in front of the application who answers, not you, and
+        this tool has no way to say yes on their behalf.
+        """
+        with session() as conn:
+            return _get_run(conn, run_id)
 
     @server.tool()
     async def dry_run_workflow(
@@ -351,9 +399,14 @@ def serve(
     LibreChat) needs ``0.0.0.0`` -- which also turns off the DNS-rebinding
     protection the MCP SDK enables for localhost, because the client will send
     a ``Host`` header this process has never heard of.
+
+    Over HTTP this process is a daemon, so it also drains the queue. Over stdio
+    it is not: it lives and dies with one MCP host, and a queued run picked up
+    here would be killed the moment that host went away.
     """
-    server = build_server(paths)
     if port is None:
-        server.run(transport="stdio")
+        build_server(paths).run(transport="stdio")
     else:
-        server.run(transport="streamable-http", host=host, port=port)
+        build_server(paths, drain=True).run(
+            transport="streamable-http", host=host, port=port
+        )

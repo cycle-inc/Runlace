@@ -22,7 +22,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .db import Connection, find_run, find_step, list_steps
+from .db import (
+    Connection,
+    find_run,
+    find_step,
+    find_version_by_id,
+    find_workflow,
+    list_steps,
+)
+from .queue import AWAITING_APPROVAL, COMPLETED, TERMINAL
 
 CODE_UNKNOWN_RUN = "unknown-run"
 CODE_UNKNOWN_STEP = "unknown-step"
@@ -40,6 +48,76 @@ MAX_STRING = 300
 # come back verbatim until they are big enough to be the problem themselves: a
 # 50 KB `body=`, a bulk create with five hundred items.
 PAYLOAD_BUDGET = 2000
+
+
+def get_run(conn: Connection, run_id: str) -> dict[str, Any]:
+    """Where one run got to, and what it produced. The same shape as run_workflow.
+
+    Deliberately the same shape: a caller that stopped waiting and came back
+    later should not have to read a second kind of answer to learn the same
+    thing. ``steps`` carries no payloads, for the same reason it never does --
+    ``get_step`` is how you look inside one.
+    """
+    row = find_run(conn, run_id)
+    if row is None:
+        return {
+            "ok": False,
+            "code": CODE_UNKNOWN_RUN,
+            "error": f"no run called `{run_id}`",
+            "hint": "`run_id` comes back from run_workflow and dry_run_workflow, "
+            "on refusals as well as on successes.",
+        }
+
+    status = str(row["status"])
+    result: dict[str, Any] = {
+        **_whose_run(conn, row),
+        "run_id": run_id,
+        "ok": status == COMPLETED,
+        "status": status,
+        "finished": status in TERMINAL,
+        "dry_run": bool(row["dry_run"]),
+        "output": _decode(row["output_json"]),
+        "error": row["error"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "steps": [_step_summary(step) for step in list_steps(conn, run_id)],
+    }
+    if status == AWAITING_APPROVAL:
+        result["hint"] = (
+            "It is waiting for a human to approve it. Nothing has run and "
+            "nothing will until approve_run is called with this run_id."
+        )
+    elif status not in TERMINAL:
+        result["hint"] = f"It is `{status}`. Ask again in a moment."
+    if row["approval_note"] is not None:
+        result["approval_note"] = row["approval_note"]
+    return result
+
+
+def _whose_run(conn: Connection, row: Any) -> dict[str, Any]:
+    """The workflow a run belongs to. A run row knows only its version."""
+    version = find_version_by_id(conn, str(row["workflow_version_id"]))
+    if version is None:
+        return {"workflow_id": None, "name": None, "version": None}
+    workflow = find_workflow(conn, str(version["workflow_id"]))
+    return {
+        "workflow_id": str(version["workflow_id"]),
+        "name": str(workflow["name"]) if workflow is not None else None,
+        "version": str(version["version_hash"]),
+    }
+
+
+def _step_summary(step: Any) -> dict[str, Any]:
+    """The same seven fields ``run_workflow`` reports, read back off the journal."""
+    return {
+        "seq": int(step["seq"]),
+        "connector": str(step["connector"]),
+        "tool": str(step["tool"]),
+        "risk": str(step["risk"]),
+        "status": str(step["status"]),
+        "duration_ms": step["duration_ms"],
+        "error": step["error"],
+    }
 
 
 def get_step(conn: Connection, run_id: str, seq: int) -> dict[str, Any]:
