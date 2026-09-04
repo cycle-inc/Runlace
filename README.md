@@ -401,6 +401,12 @@ runs can differ. Everything else holds -- the same code, the same pinned tools,
 the same journal, the same gates -- and a workflow that does not call `ctx.ai`
 is exactly what it was before. It is opt-in one line at a time.
 
+`scripts/m10_acceptance.sh` runs all of that against a real Ollama: one workflow
+that reads a live temperature and then asks the model whether it is coat
+weather, refused before a model is configured, journaled with its tokens after,
+parked for confirmation when the model moves off the machine, and failed
+readably by a backend that answers the wrong shape twice.
+
 ## Adding MCP servers after the first run
 
 `init` imports a list of configs and writes exactly that list. That is right the
@@ -619,6 +625,7 @@ uv run pyright                   # Runlace's own source and tests
 ./scripts/m4_acceptance.sh       # the M4 acceptance criterion, end to end
 ./scripts/m5_acceptance.sh       # sync, the wheel, and the wheel on its own
 ./scripts/m6_acceptance.sh       # create -> dry run -> edit -> refuse -> confirm
+./scripts/m10_acceptance.sh      # ctx.ai against a live Ollama, needs `ollama serve`
 ./scripts/demo.sh                # the two-minute demo
 ./scripts/demo_agent.py          # let a local model write the workflow
 ./scripts/chat_ui.sh up          # a chat UI on localhost:3000, see above
