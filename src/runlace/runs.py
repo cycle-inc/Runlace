@@ -10,11 +10,18 @@ The order is the spec's, and it is the whole point of this module:
 
 Every attempt that got as far as naming a version is journaled, refusals
 included -- ``runs`` and ``steps`` are the audit log, not a success log.
+
+Steps 1-3 are :func:`admit` and steps 4-5 are :func:`execute`, with
+:func:`run_workflow` doing both back to back. The seam is there because the
+queue needs it: the gates have to answer the caller straight away -- a
+misspelled input is not news to break to someone three minutes later -- while
+the running part is what a worker picks up whenever it gets to it.
 """
 
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Connector, read_config
@@ -51,6 +58,30 @@ CODE_WORKFLOW_FAILED = "workflow-failed"
 CODE_INVALID_OUTPUT = "invalid-output"
 
 
+@dataclass(frozen=True)
+class Refused:
+    """A run the gates turned away. ``result`` is the answer, already shaped."""
+
+    result: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Admitted:
+    """A run that passed the gates: everything :func:`execute` needs, and no more.
+
+    It is deliberately not a database row. What the gates decided -- the
+    resolved inputs after defaults, which tools count as side effects under
+    *today's* policy -- is settled at admission time and must not be recomputed
+    later against a policy file somebody edited in between.
+    """
+
+    run_id: str
+    record: dict[str, Any]
+    inputs: dict[str, Any]
+    dry_run: bool = False
+    side_effects: list[dict[str, Any]] = field(default_factory=list)
+
+
 async def run_workflow(
     conn: Connection,
     paths: RunlacePaths,
@@ -74,29 +105,65 @@ async def run_workflow(
     ``call_tool`` is injectable so tests can run a real subprocess against fake
     tools. Left unset, sessions are opened to the connectors the workflow uses.
     """
+    admission = admit(
+        conn,
+        paths,
+        workflow=workflow,
+        inputs=inputs,
+        confirm=confirm,
+        version=version,
+        dry_run=dry_run,
+    )
+    if isinstance(admission, Refused):
+        return admission.result
+    return await execute(
+        conn, paths, admission, call_tool=call_tool, timeout=timeout
+    )
+
+
+def admit(
+    conn: Connection,
+    paths: RunlacePaths,
+    *,
+    workflow: str,
+    inputs: dict[str, Any] | None = None,
+    confirm: bool = False,
+    version: str | None = None,
+    dry_run: bool = False,
+) -> Refused | Admitted:
+    """The gates: everything that can be decided before anything executes.
+
+    Writes the run row, so a refusal is journaled like any other attempt, and
+    touches no MCP server -- this is cheap and synchronous on purpose.
+    """
     record = get_workflow(conn, workflow, version=version)
     if record is None:
-        return _refused(
-            None,
-            CODE_UNKNOWN_WORKFLOW,
-            f"no workflow called `{workflow}`",
-            "Call list_workflows to see what exists.",
+        return Refused(
+            _refused(
+                None,
+                CODE_UNKNOWN_WORKFLOW,
+                f"no workflow called `{workflow}`",
+                "Call list_workflows to see what exists.",
+            )
         )
     if record.get("version") is None:
-        return _refused(
-            None,
-            CODE_UNKNOWN_WORKFLOW,
-            str(record.get("error") or "that workflow has no such version"),
-            "Call get_workflow to see which versions exist.",
+        return Refused(
+            _refused(
+                None,
+                CODE_UNKNOWN_WORKFLOW,
+                str(record.get("error") or "that workflow has no such version"),
+                "Call get_workflow to see which versions exist.",
+            )
         )
-    code = record.get("code")
-    if not isinstance(code, str):
-        return _refused(
-            None,
-            CODE_NO_CODE,
-            f"the code for version {record['version']} is missing from disk",
-            f"Expected it at {record.get('file_path')}. Re-create the workflow "
-            f"with create_workflow.",
+    if not isinstance(record.get("code"), str):
+        return Refused(
+            _refused(
+                None,
+                CODE_NO_CODE,
+                f"the code for version {record['version']} is missing from disk",
+                f"Expected it at {record.get('file_path')}. Re-create the workflow "
+                f"with create_workflow.",
+            )
         )
 
     given = dict(inputs or {})
@@ -113,11 +180,9 @@ async def run_workflow(
     )
     conn.commit()
 
-    def refuse(code: str, error: str, hint: str, **extra: Any) -> dict[str, Any]:
-        finish_run(conn, run_id, status=STATUS_FAILED, error=error)
-        conn.commit()
-        return _refused(
-            run_id, code, error, hint, record=record, dry_run=dry_run, **extra
+    def refuse(code: str, error: str, hint: str, **extra: Any) -> Refused:
+        return Refused(
+            _fail(conn, run_id, record, code, error, hint, dry_run=dry_run, **extra)
         )
 
     # 1. inputs
@@ -170,14 +235,47 @@ async def run_workflow(
             ],
         )
 
+    return Admitted(
+        run_id=run_id,
+        record=record,
+        inputs=resolved,
+        dry_run=dry_run,
+        side_effects=[
+            {"connector": str(t["connector"]), "tool": str(t["tool"])}
+            for t in side_effects
+        ],
+    )
+
+
+async def execute(
+    conn: Connection,
+    paths: RunlacePaths,
+    admitted: Admitted,
+    *,
+    call_tool: CallTool | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Run an admitted workflow to the end and journal it. Steps 4 and 5.
+
+    Everything here needs the outside world -- a subprocess, the MCP servers --
+    which is why it is separate from :func:`admit` and why a worker can be the
+    one doing it, minutes after the caller was answered.
+    """
+    run_id = admitted.run_id
+    record = admitted.record
+    dry_run = admitted.dry_run
+    resolved = admitted.inputs
+    code = str(record["code"])
+
+    def refuse(code: str, error: str, hint: str, **extra: Any) -> dict[str, Any]:
+        return _fail(conn, run_id, record, code, error, hint, dry_run=dry_run, **extra)
+
     # 4. run
     #
     # In a dry run the side-effecting tools are never called, so the servers
     # that only host them are never needed either -- you can dry-run a workflow
     # before the connector that would send the email is even reachable.
-    simulated = [
-        {"connector": str(t["connector"]), "tool": str(t["tool"])} for t in side_effects
-    ]
+    simulated = admitted.side_effects if dry_run else []
     needed = [
         t
         for t in record["tools_used"]
@@ -344,6 +442,28 @@ def _identity(run_id: str | None, record: dict[str, Any]) -> dict[str, Any]:
         "name": record.get("name"),
         "version": record.get("version"),
     }
+
+
+def _fail(
+    conn: Connection,
+    run_id: str,
+    record: dict[str, Any],
+    code: str,
+    error: str,
+    hint: str,
+    *,
+    dry_run: bool,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Close a run that will not go on, and shape the answer. One place for both.
+
+    The two callers are the gates and the runner, and they must agree: a run
+    turned away at admission and one that died reaching for a connector are the
+    same thing to whoever is reading the journal afterwards.
+    """
+    finish_run(conn, run_id, status=STATUS_FAILED, error=error)
+    conn.commit()
+    return _refused(run_id, code, error, hint, record=record, dry_run=dry_run, **extra)
 
 
 def _refused(
