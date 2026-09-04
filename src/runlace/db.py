@@ -123,6 +123,16 @@ MIGRATIONS = [
     # Why a parked run ended the way it did -- the reason a human gave for
     # refusing it, or the fact that nobody answered in time.
     "ALTER TABLE runs ADD COLUMN approval_note TEXT",
+    # v5 (M7): exactly one process may drain the queue for a home. Two
+    # `runlace serve` on the same `~/.runlace` would otherwise both claim runs,
+    # and while claiming is safe, running the same side effect twice because
+    # somebody left a second daemon open is not a failure mode worth having.
+    """CREATE TABLE IF NOT EXISTS queue_lock (
+        id        TEXT PRIMARY KEY,
+        owner_pid INTEGER NOT NULL,
+        hostname  TEXT NOT NULL,
+        heartbeat TEXT NOT NULL
+    )""",
 ]
 
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
@@ -138,6 +148,13 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # A worker executing runs and an MCP tool answering a question are two
+    # connections to one file, and under the default rollback journal the reader
+    # blocks the writer. WAL lets them get on with it; `busy_timeout` says to
+    # wait for the write lock rather than raise "database is locked" at whoever
+    # asked. Both are cheap and neither changes what is stored.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.executescript(SCHEMA)
     _migrate(conn)
     conn.execute(
@@ -413,6 +430,73 @@ def insert_run(
             queued_at,
         ),
     )
+
+
+QUEUE_LOCK_ID = "drainer"
+
+
+def take_queue_lock(
+    conn: sqlite3.Connection, *, owner_pid: int, hostname: str, stale_before: str
+) -> bool:
+    """Claim the right to drain this home's queue. True if we now hold it.
+
+    Taken again by the same process it is a renewal, which is how a worker says
+    it is still alive. Held by someone whose heartbeat stopped before
+    ``stale_before`` it is taken over -- a daemon that was killed must not lock
+    the queue until someone notices.
+    """
+    # An empty heartbeat sorts before every timestamp, so a row inserted here
+    # is immediately free for the UPDATE below to take. That keeps the whole
+    # thing two statements with no race between them worth naming.
+    conn.execute(
+        "INSERT OR IGNORE INTO queue_lock(id, owner_pid, hostname, heartbeat) "
+        "VALUES(?, 0, '', '')",
+        (QUEUE_LOCK_ID,),
+    )
+    took = conn.execute(
+        """
+        UPDATE queue_lock SET owner_pid = ?, hostname = ?, heartbeat = ?
+        WHERE id = ?
+          AND ((owner_pid = ? AND hostname = ?) OR heartbeat < ?)
+        """,
+        (
+            owner_pid,
+            hostname,
+            now_iso(),
+            QUEUE_LOCK_ID,
+            owner_pid,
+            hostname,
+            stale_before,
+        ),
+    ).rowcount
+    conn.commit()
+    return bool(took)
+
+
+def release_queue_lock(
+    conn: sqlite3.Connection, *, owner_pid: int, hostname: str
+) -> None:
+    """Let go on a clean shutdown, so the next daemon does not wait out the timeout."""
+    conn.execute(
+        "DELETE FROM queue_lock WHERE id = ? AND owner_pid = ? AND hostname = ?",
+        (QUEUE_LOCK_ID, owner_pid, hostname),
+    )
+    conn.commit()
+
+
+def queue_lock_holder(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM queue_lock WHERE id = ?", (QUEUE_LOCK_ID,)
+    ).fetchone()
+
+
+def find_version_by_id(
+    conn: sqlite3.Connection, version_id: str
+) -> sqlite3.Row | None:
+    """A version on its own. A run knows its version and nothing else about itself."""
+    return conn.execute(
+        "SELECT * FROM workflow_versions WHERE id = ?", (version_id,)
+    ).fetchone()
 
 
 def claim_queued_run(conn: sqlite3.Connection) -> sqlite3.Row | None:

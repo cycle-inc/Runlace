@@ -209,19 +209,7 @@ def admit(
         )
 
     # 3. confirm (D6)
-    #
-    # The risk pinned on the version is what the tool was when the workflow was
-    # compiled. `policy.yaml` may have been edited since, and an edit that marks
-    # a tool dangerous has to reach workflows that already exist -- otherwise
-    # the override protects nothing you already built. It only ever tightens:
-    # relaxing a pinned `side_effect` would need a new version, which is the
-    # safe direction to require paperwork in.
-    policy = read_policy(paths.policy)
-    side_effects = [
-        t
-        for t in record["tools_used"]
-        if _effective_risk(policy, t) != "read_only"
-    ]
+    side_effects = side_effects_of(read_policy(paths.policy), record)
     if side_effects and not confirm and not dry_run:
         names = ", ".join(f"{t['connector']}.{t['tool']}" for t in side_effects)
         return refuse(
@@ -230,9 +218,7 @@ def admit(
             f"without confirm",
             "Show the human exactly which tools will act, and call run_workflow "
             "again with confirm=True only after they agree.",
-            side_effects=[
-                {"connector": t["connector"], "tool": t["tool"]} for t in side_effects
-            ],
+            side_effects=side_effects,
         )
 
     return Admitted(
@@ -240,10 +226,7 @@ def admit(
         record=record,
         inputs=resolved,
         dry_run=dry_run,
-        side_effects=[
-            {"connector": str(t["connector"]), "tool": str(t["tool"])}
-            for t in side_effects
-        ],
+        side_effects=side_effects,
     )
 
 
@@ -442,6 +425,23 @@ def _identity(run_id: str | None, record: dict[str, Any]) -> dict[str, Any]:
         "name": record.get("name"),
         "version": record.get("version"),
     }
+
+
+def side_effects_of(policy: Policy, record: dict[str, Any]) -> list[dict[str, Any]]:
+    """The tools in this workflow that act on the world, under today's policy.
+
+    The risk pinned on the version is what the tool was when the workflow was
+    compiled. `policy.yaml` may have been edited since, and an edit that marks a
+    tool dangerous has to reach workflows that already exist -- otherwise the
+    override protects nothing you already built. It only ever tightens: relaxing
+    a pinned `side_effect` would need a new version, which is the safe direction
+    to require paperwork in.
+    """
+    return [
+        {"connector": str(t["connector"]), "tool": str(t["tool"])}
+        for t in record["tools_used"]
+        if _effective_risk(policy, t) != "read_only"
+    ]
 
 
 def _fail(
